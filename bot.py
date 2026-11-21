@@ -152,10 +152,14 @@ def db_open():
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, buy INTEGER, sell INTEGER,
       bought_at INTEGER, sold_at INTEGER);
     """)
-    try:
-        c.execute("ALTER TABLE listings ADD COLUMN hidden INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+    for ddl in ("ALTER TABLE listings ADD COLUMN hidden INTEGER DEFAULT 0",
+                "ALTER TABLE trades ADD COLUMN listing_id INTEGER"):
+        try:
+            c.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+    c.execute("""CREATE TABLE IF NOT EXISTS saved(
+      id INTEGER PRIMARY KEY, saved_at INTEGER, last_price INTEGER, gone_notified INTEGER DEFAULT 0)""")
     return c
 
 
@@ -284,7 +288,8 @@ def card_kb(row):
     return json.dumps({"inline_keyboard": [
         [{"text": "🔗 Открыть объявление", "url": row["url"]}],
         [{"text": "✅ Купил", "callback_data": f"buy:{row['id']}"},
-         {"text": "🚫 Не показывать", "callback_data": f"ign:{row['id']}"}]]})
+         {"text": "⭐ Сохранить", "callback_data": f"save:{row['id']}"}],
+        [{"text": "🚫 Не показывать", "callback_data": f"ign:{row['id']}"}]]})
 
 
 def send_card(chat, row, v, tag):
@@ -405,7 +410,7 @@ def report(c, chat):
 
 # ---------- UI ----------
 MAIN_KB = json.dumps({"keyboard": [["📊 Статистика", "🔥 Топ моделей"], ["💰 Бюджет", "🎯 Цель"],
-                                    ["🧾 Мои сделки", "⚙️ Настройки"]], "resize_keyboard": True})
+                                    ["🧾 Мои сделки", "⭐ Избранное"], ["⚙️ Настройки"]], "resize_keyboard": True})
 NUM = {  # key: (title, presets, unit)
     "budget": ("💰 Бюджет на покупку", [100, 200, 300, 500, 700, 1000, 1500], "€"),
     "goal": ("🎯 Цель на месяц (прибыль)", [300, 500, 800, 1000, 1500], "€"),
@@ -441,15 +446,88 @@ def settings_menu(c):
     return text, json.dumps(kb)
 
 
+def fmt_day(ts):
+    return datetime.fromtimestamp(ts, TZ).strftime("%d.%m")
+
+
 def trades_menu(c):
-    rows = c.execute("SELECT id,name,buy FROM trades WHERE sold_at IS NULL ORDER BY bought_at DESC LIMIT 10").fetchall()
+    rows = c.execute("""SELECT * FROM trades ORDER BY (sold_at IS NOT NULL), COALESCE(sold_at, bought_at) DESC LIMIT 15""").fetchall()
     text = "🧾 <b>Мои сделки</b>\n\n" + stats_text(c)
-    kb = [[{"text": f"📤 Продал: {r['name'][:28]} ({r['buy']} €)", "callback_data": f"sell:{r['id']}"}] for r in rows]
-    if rows:
-        text += "\n\nНажми на товар, который продал, и введи цену продажи."
-    else:
-        text += "\n\nПока нет купленных товаров. Нажми «✅ Купил» под карточкой объявления."
+    kb = []
+    for r in rows:
+        if r["sold_at"]:
+            label = f"✅ {r['name'][:26]} (+{r['sell'] - r['buy']} €)"
+        else:
+            label = f"📦 {r['name'][:26]} ({r['buy']} €)"
+        kb.append([{"text": label, "callback_data": f"tr:{r['id']}"}])
+    text += ("\n\nНажми на сделку, чтобы продать, изменить или удалить её." if rows
+             else "\n\nПока нет сделок. Нажми «✅ Купил» под карточкой объявления.")
     return text, json.dumps({"inline_keyboard": kb}) if kb else None
+
+
+def trade_detail(c, tid):
+    t = c.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
+    if not t:
+        return "Сделка не найдена.", None
+    text = f"🧾 <b>{esc(t['name'])}</b>\nКуплено: <b>{t['buy']} €</b> ({fmt_day(t['bought_at'])})"
+    if t["sold_at"]:
+        text += f"\nПродано: <b>{t['sell']} €</b> ({fmt_day(t['sold_at'])})\n💰 Прибыль: <b>{t['sell'] - t['buy']} €</b>"
+        first = [{"text": "✏️ Цена продажи", "callback_data": f"esell:{tid}"}, {"text": "↩️ Вернуть на склад", "callback_data": f"reopen:{tid}"}]
+    else:
+        text += "\nСтатус: 📦 на складе"
+        first = [{"text": "📤 Продал", "callback_data": f"sell:{tid}"}]
+    kb = [first,
+          [{"text": "✏️ Цена покупки", "callback_data": f"ebuy:{tid}"}, {"text": "✏️ Название", "callback_data": f"ename:{tid}"}],
+          [{"text": "🗑 Удалить сделку", "callback_data": f"delq:{tid}"}],
+          [{"text": "⬅️ Все сделки", "callback_data": "menu:trades"}]]
+    return text, json.dumps({"inline_keyboard": kb})
+
+
+def favorites_menu(c):
+    rows = c.execute("""SELECT s.id, s.last_price, l.title, l.price, l.active FROM saved s
+                        JOIN listings l ON l.id=s.id ORDER BY s.saved_at DESC LIMIT 20""").fetchall()
+    if not rows:
+        return "⭐ <b>Избранное</b>\n\nПусто. Нажми «⭐ Сохранить» под карточкой объявления.", None
+    kb = []
+    for r in rows:
+        mark = "" if r["active"] else "❌ "
+        kb.append([{"text": f"{mark}{r['title'][:30]} — {r['price']} €", "callback_data": f"fav:{r['id']}"}])
+    return "⭐ <b>Избранное</b>\n\n❌ — объявление исчезло (скорее всего продано). Нажми на объявление, чтобы открыть.", json.dumps({"inline_keyboard": kb})
+
+
+def fav_detail(c, lid):
+    row = c.execute("SELECT * FROM listings WHERE id=?", (lid,)).fetchone()
+    s = c.execute("SELECT * FROM saved WHERE id=?", (lid,)).fetchone()
+    if not row or not s:
+        return "Объявление не найдено.", None
+    term = next((t for t in TERMS if t[0] == row["term"]), TERMS[0])
+    text = card(row, valuation(c, row, term[1]), "⭐ Избранное")
+    if s["last_price"] and row["price"] != s["last_price"]:
+        text += f"\n💶 Цена при сохранении: {s['last_price']} € → сейчас {row['price']} €"
+    if not row["active"]:
+        text += "\n❌ Объявление исчезло — вероятно, продано."
+    kb = [[{"text": "🔗 Открыть объявление", "url": row["url"]}],
+          [{"text": "✅ Купил", "callback_data": f"buy:{lid}"}, {"text": "🗑 Убрать", "callback_data": f"unsave:{lid}"}],
+          [{"text": "⬅️ Избранное", "callback_data": "menu:fav"}]]
+    return text, json.dumps({"inline_keyboard": kb})
+
+
+def notify_saved(c, chat):
+    """Alert when a saved listing gets cheaper or disappears."""
+    if not chat:
+        return
+    for s in c.execute("SELECT * FROM saved").fetchall():
+        row = c.execute("SELECT * FROM listings WHERE id=?", (s["id"],)).fetchone()
+        if not row:
+            continue
+        kb = json.dumps({"inline_keyboard": [[{"text": "⭐ Открыть в избранном", "callback_data": f"fav:{s['id']}"}]]})
+        if not row["active"] and not s["gone_notified"]:
+            send(chat, f"❌ Объявление из избранного исчезло (вероятно, продано):\n<b>{esc(row['title'])}</b>", kb)
+            c.execute("UPDATE saved SET gone_notified=1 WHERE id=?", (s["id"],))
+        elif row["active"] and row["price"] and s["last_price"] and row["price"] < s["last_price"]:
+            send(chat, f"📉 Цена в избранном снизилась: <b>{esc(row['title'])}</b>\n{s['last_price']} € → <b>{row['price']} €</b>", kb)
+            c.execute("UPDATE saved SET last_price=? WHERE id=?", (row["price"], s["id"]))
+    c.commit()
 
 
 def status_text(c):
@@ -491,6 +569,8 @@ def open_menu(c, chat, msg_id, name):
         t, kb = settings_menu(c)
     elif name == "trades":
         t, kb = trades_menu(c)
+    elif name == "fav":
+        t, kb = favorites_menu(c)
     elif name == "status":
         t, kb = status_text(c), None
     else:
@@ -507,7 +587,7 @@ def on_text(c, chat, text):
     pending = meta_get(c, "await", "")
     # a menu button always cancels a pending text input
     buttons = {"📊 Статистика": "stats", "🔥 Топ моделей": "top", "💰 Бюджет": "budget", "🎯 Цель": "goal",
-               "🧾 Мои сделки": "trades", "⚙️ Настройки": "settings"}
+               "🧾 Мои сделки": "trades", "⭐ Избранное": "fav", "⚙️ Настройки": "settings"}
     if text in buttons:
         meta_set(c, "await", "")
         b = buttons[text]
@@ -521,21 +601,31 @@ def on_text(c, chat, text):
     if pending:
         meta_set(c, "await", "")
         kind, _, arg = pending.partition(":")
-        if kind == "num" and re.fullmatch(r"\d{1,6}", text):
+        is_num = re.fullmatch(r"\d{1,6}", text) is not None
+        if kind == "num" and is_num:
             set_num(c, arg, text)
             return open_menu(c, chat, None, arg)
-        if kind == "sell" and re.fullmatch(r"\d{1,6}", text):
+        if kind == "sell" and is_num:
             t = c.execute("SELECT * FROM trades WHERE id=?", (int(arg),)).fetchone()
             if t:
                 c.execute("UPDATE trades SET sell=?, sold_at=? WHERE id=?", (int(text), NOW, t["id"]))
                 return send(chat, f"📤 Продано: {esc(t['name'])}\n💰 Прибыль: <b>{int(text) - t['buy']} €</b>\n\n" + stats_text(c), MAIN_KB)
+        if kind in ("ebuy", "esell") and is_num:
+            col = "buy" if kind == "ebuy" else "sell"
+            c.execute(f"UPDATE trades SET {col}=? WHERE id=?", (int(text), int(arg)))
+            t, kb = trade_detail(c, int(arg))
+            return send(chat, "✅ Изменено.\n\n" + t, kb)
+        if kind == "ename" and text:
+            c.execute("UPDATE trades SET name=? WHERE id=?", (text[:60], int(arg)))
+            t, kb = trade_detail(c, int(arg))
+            return send(chat, "✅ Изменено.\n\n" + t, kb)
         if kind == "ignore" and text:
             words = [w for w in cfg(c, "ignore").split(",") if w] + [text.lower()]
             meta_set(c, "cfg_ignore", ",".join(dict.fromkeys(words)))
             return open_menu(c, chat, None, "settings")
-        return send(chat, "Не понял. Введи число или выбери кнопку.", MAIN_KB)
+        return send(chat, "Не понял. Введи число (или текст для названия) либо выбери кнопку.", MAIN_KB)
     if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
-        meta_set(c, "kb_v", "1")
+        meta_set(c, "kb_v", "2")
         return send(chat, WELCOME, MAIN_KB)
     send(chat, "Выбери действие кнопками внизу 👇", MAIN_KB)
 
@@ -544,8 +634,11 @@ def on_callback(c, chat, cq):
     data = cq.get("data", "")
     msg = cq.get("message") or {}
     mid = msg.get("message_id")
-    tg("answerCallbackQuery", callback_query_id=cq["id"])
     act, _, rest = data.partition(":")
+    toast = {"save": "⭐ Сохранено в избранное", "unsave": "Убрано из избранного", "buy": "📥 Покупка записана",
+             "ign": "🚫 Скрыто"}.get(act, "")
+    tg("answerCallbackQuery", callback_query_id=cq["id"], **({"text": toast} if toast else {}))
+    ask = lambda kind, tid, q: (meta_set(c, "await", f"{kind}:{tid}"), send(chat, q))
     if act == "menu":
         open_menu(c, chat, mid, rest)
     elif act == "set":
@@ -565,16 +658,51 @@ def on_callback(c, chat, cq):
     elif act == "buy":
         r = c.execute("SELECT title, price FROM listings WHERE id=?", (int(rest),)).fetchone()
         if r:
-            c.execute("INSERT INTO trades(name,buy,bought_at) VALUES(?,?,?)", (r["title"][:60], r["price"], NOW))
-            send(chat, f"📥 Записал покупку: {esc(r['title'][:60])} за <b>{r['price']} €</b>.\nКогда продашь — «🧾 Мои сделки».", MAIN_KB)
+            dup = c.execute("SELECT id FROM trades WHERE listing_id=?", (int(rest),)).fetchone()
+            if dup:
+                t, kb = trade_detail(c, dup["id"])
+                send(chat, "Эта покупка уже записана.\n\n" + t, kb)
+            else:
+                cur = c.execute("INSERT INTO trades(name,buy,bought_at,listing_id) VALUES(?,?,?,?)",
+                                (r["title"][:60], r["price"], NOW, int(rest)))
+                kb = json.dumps({"inline_keyboard": [[{"text": "✏️ Изменить / 🗑 Отменить", "callback_data": f"tr:{cur.lastrowid}"}]]})
+                send(chat, f"📥 Записал покупку: {esc(r['title'][:60])} за <b>{r['price']} €</b>.\nНажал случайно? Кнопка ниже отменит запись.", kb)
     elif act == "ign":
         c.execute("UPDATE listings SET hidden=1 WHERE id=?", (int(rest),))
-        send(chat, "🚫 Больше не показываю это объявление.")
+    elif act == "save":
+        r = c.execute("SELECT price FROM listings WHERE id=?", (int(rest),)).fetchone()
+        if r:
+            c.execute("INSERT OR IGNORE INTO saved(id,saved_at,last_price) VALUES(?,?,?)", (int(rest), NOW, r["price"]))
+    elif act == "unsave":
+        c.execute("DELETE FROM saved WHERE id=?", (int(rest),))
+        open_menu(c, chat, mid, "fav")
+    elif act == "fav":
+        t, kb = fav_detail(c, int(rest))
+        send(chat, t, kb)
+    elif act == "tr":
+        t, kb = trade_detail(c, int(rest))
+        show(chat, mid, t, kb)
     elif act == "sell":
         t = c.execute("SELECT name,buy FROM trades WHERE id=?", (int(rest),)).fetchone()
         if t:
-            meta_set(c, "await", "sell:" + rest)
-            send(chat, f"📤 За сколько продал «{esc(t['name'])}» (куплено за {t['buy']} €)? Напиши число в евро:")
+            ask("sell", rest, f"📤 За сколько продал «{esc(t['name'])}» (куплено за {t['buy']} €)? Напиши число в евро:")
+    elif act == "ebuy":
+        ask("ebuy", rest, "✏️ Напиши новую цену покупки (число в евро):")
+    elif act == "esell":
+        ask("esell", rest, "✏️ Напиши новую цену продажи (число в евро):")
+    elif act == "ename":
+        ask("ename", rest, "✏️ Напиши новое название:")
+    elif act == "reopen":
+        c.execute("UPDATE trades SET sell=NULL, sold_at=NULL WHERE id=?", (int(rest),))
+        t, kb = trade_detail(c, int(rest))
+        show(chat, mid, "↩️ Возвращено на склад.\n\n" + t, kb)
+    elif act == "delq":
+        kb = json.dumps({"inline_keyboard": [[{"text": "🗑 Да, удалить", "callback_data": f"delok:{rest}"},
+                                              {"text": "Нет", "callback_data": f"tr:{rest}"}]]})
+        show(chat, mid, "Точно удалить эту сделку? Она пропадёт из статистики.", kb)
+    elif act == "delok":
+        c.execute("DELETE FROM trades WHERE id=?", (int(rest),))
+        open_menu(c, chat, mid, "trades")
     c.commit()
 
 
@@ -603,9 +731,9 @@ def process_updates(c, wait=0):
             else:
                 on_text(c, chat, text)
         c.commit()
-    if chat and meta_get(c, "kb_v") != "1":
-        meta_set(c, "kb_v", "1")
-        send(chat, "🔄 Бот обновлён: теперь всё на русском и управляется кнопками внизу 👇", MAIN_KB)
+    if chat and meta_get(c, "kb_v") != "2":
+        meta_set(c, "kb_v", "2")
+        send(chat, "🔄 Бот обновлён: добавлены «⭐ Избранное» и редактирование сделок (нажми на сделку в «🧾 Мои сделки») 👇", MAIN_KB)
     return chat
 
 
@@ -613,6 +741,7 @@ def scan_cycle(c, chat):
     scan_local_macs(c, chat)
     scan_market_term(c, chat)
     check_gone(c)
+    notify_saved(c, chat)
     local_now = datetime.now(TZ)
     today = local_now.strftime("%Y-%m-%d")
     if chat and local_now.hour >= 8 and meta_get(c, "last_report") != today:
