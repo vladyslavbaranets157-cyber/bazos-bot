@@ -11,7 +11,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Load state (data branch)
@@ -24,6 +24,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
           DB_PATH: data/bazos.db
+          RUN_SECONDS: "1500"
         run: python3 bot.py
       - name: Save state
         if: always()

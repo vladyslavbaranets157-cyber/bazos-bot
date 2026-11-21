@@ -101,11 +101,11 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-def http(url, data=None, tries=3):
+def http(url, data=None, tries=3, timeout=25):
     for i in range(tries):
         try:
             req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, "Accept-Language": "sk"})
-            with urllib.request.urlopen(req, timeout=25) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status, r.read().decode("utf-8", "replace"), r.geturl()
         except urllib.error.HTTPError as e:
             if e.code in (404, 410):
@@ -122,7 +122,8 @@ def tg(method, **params):
         log("[no TG_TOKEN] would call", method, json.dumps(params, ensure_ascii=False)[:300])
         return None
     data = urllib.parse.urlencode(params).encode()
-    st, body, _ = http(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=data)
+    st, body, _ = http(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=data,
+                       timeout=int(params.get("timeout", 0)) + 20)
     try:
         return json.loads(body)
     except Exception:
@@ -577,9 +578,9 @@ def on_callback(c, chat, cq):
     c.commit()
 
 
-def process_updates(c):
+def process_updates(c, wait=0):
     chat = TG_CHAT_ENV or meta_get(c, "chat_id")
-    r = tg("getUpdates", offset=int(meta_get(c, "tg_offset", 0)), timeout=0)
+    r = tg("getUpdates", offset=int(meta_get(c, "tg_offset", 0)), timeout=wait)
     if r and r.get("ok"):
         for u in r["result"]:
             meta_set(c, "tg_offset", u["update_id"] + 1)
@@ -608,21 +609,41 @@ def process_updates(c):
     return chat
 
 
+def scan_cycle(c, chat):
+    scan_local_macs(c, chat)
+    scan_market_term(c, chat)
+    check_gone(c)
+    local_now = datetime.now(TZ)
+    today = local_now.strftime("%Y-%m-%d")
+    if chat and local_now.hour >= 8 and meta_get(c, "last_report") != today:
+        report(c, chat)
+        meta_set(c, "last_report", today)
+    c.commit()
+
+
 def main():
+    global NOW
+    run_seconds = int(os.environ.get("RUN_SECONDS", "0") or 0)  # 0 = single pass
+    end = time.time() + run_seconds
     c = db_open()
-    chat = process_updates(c)
-    if not chat:
-        log("no chat yet: send /start to the bot")
+    last_scan = 0.0
     try:
-        scan_local_macs(c, chat)
-        scan_market_term(c, chat)
-        check_gone(c)
-        local_now = datetime.now(TZ)
-        today = local_now.strftime("%Y-%m-%d")
-        if chat and local_now.hour >= 8 and meta_get(c, "last_report") != today:
-            report(c, chat)
-            meta_set(c, "last_report", today)
-        c.commit()
+        while True:
+            NOW = int(time.time())
+            chat = process_updates(c, wait=25 if run_seconds else 0)
+            if not chat:
+                log("no chat yet: send /start to the bot")
+            if time.time() - last_scan >= 300:
+                try:
+                    scan_cycle(c, chat)
+                except Exception as e:  # keep the listener alive
+                    log("scan error", repr(e))
+                last_scan = time.time()
+            c.commit()
+            if time.time() >= end:
+                break
+            if not TG_TOKEN:
+                time.sleep(5)
     finally:
         c.close()
 
