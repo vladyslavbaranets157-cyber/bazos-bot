@@ -107,6 +107,30 @@ TERMS = [
 ]
 
 
+def specs(term, text):
+    """Memory/storage suffix so that 8/256 is compared with 8/256, not with 16/512."""
+    if term not in ("macbook", "ipad", "samsung galaxy s"):
+        return ""
+    t = text.lower()
+    ram = sto = None
+    pair = re.search(r"\b(4|8|16|24|32|64)\s*(?:gb)?\s*/\s*(128|256|512|1024|1|2)\s*(gb|tb)?\b", t) if term == "macbook" else None
+    if pair:
+        ram = int(pair.group(1))
+        sto = int(pair.group(2)) * (1024 if (pair.group(3) == "tb" or int(pair.group(2)) <= 2) else 1)
+        return f" {ram}GB/{sto}GB"
+    for n, u in re.findall(r"(\d{1,4})\s*(gb|tb|g)\b", t):
+        n = int(n)
+        if u == "tb":
+            sto = sto or n * 1024
+        elif term == "macbook" and n in (4, 8, 16, 24, 32, 64) and ram is None:
+            ram = n
+        elif n in (32, 64, 128, 256, 512, 1000, 1024, 2048) and sto is None:
+            sto = 1024 if n == 1000 else n
+    if term == "macbook":
+        return (f" {ram}GB" if ram else "") + (f"/{sto}GB" if sto else "")
+    return f" {sto}GB" if sto else ""
+
+
 # ---------- tiny helpers ----------
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
@@ -164,13 +188,19 @@ def db_open():
       bought_at INTEGER, sold_at INTEGER);
     """)
     for ddl in ("ALTER TABLE listings ADD COLUMN hidden INTEGER DEFAULT 0",
-                "ALTER TABLE trades ADD COLUMN listing_id INTEGER"):
+                "ALTER TABLE trades ADD COLUMN listing_id INTEGER",
+                "ALTER TABLE listings ADD COLUMN skey TEXT"):
         try:
             c.execute(ddl)
         except sqlite3.OperationalError:
             pass
     c.execute("""CREATE TABLE IF NOT EXISTS saved(
       id INTEGER PRIMARY KEY, saved_at INTEGER, last_price INTEGER, gone_notified INTEGER DEFAULT 0)""")
+    if meta_get(c, "skey_v") != "1":
+        for r in c.execute("SELECT id, term, mkey, title, descr FROM listings").fetchall():
+            c.execute("UPDATE listings SET skey=? WHERE id=?", ((r["mkey"] or "") + specs(r["term"], f"{r['title']} {r['descr']}"), r["id"]))
+        meta_set(c, "skey_v", "1")
+        c.commit()
     return c
 
 
@@ -240,35 +270,55 @@ def near_bratislava(zp):
 def upsert(c, it, term, keyfn, minp, local):
     """Insert/update listing. Returns (row, is_new, price_dropped)."""
     key = keyfn(it["title"])
+    skey = key + specs(term, f"{it['title']} {it['descr']}")
     risky = 1 if RISKY.search(it["title"] + " " + it["descr"]) else 0
     row = c.execute("SELECT * FROM listings WHERE id=?", (it["id"],)).fetchone()
     loc_flag = 1 if (local or near_bratislava(it["zip"])) else 0
     if row is None:
         c.execute("""INSERT INTO listings(id,title,price,url,term,mkey,loc,zip,local,risky,img,descr,views,
-                     first_seen,last_seen,price_first) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     first_seen,last_seen,price_first,skey) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (it["id"], it["title"], it["price"], it["url"], term, key, it["loc"], it["zip"], loc_flag, risky,
-                   it["img"], it["descr"], it["views"], NOW, NOW, it["price"]))
+                   it["img"], it["descr"], it["views"], NOW, NOW, it["price"], skey))
         return c.execute("SELECT * FROM listings WHERE id=?", (it["id"],)).fetchone(), True, False
     dropped = bool(row["price"] and it["price"] and it["price"] <= row["price"] * 0.9)
-    c.execute("UPDATE listings SET price=?, last_seen=?, views=?, active=1, gone_at=NULL, local=MAX(local,?), mkey=?, risky=? WHERE id=?",
-              (it["price"], NOW, it["views"], loc_flag, key, risky, it["id"]))
+    c.execute("UPDATE listings SET price=?, last_seen=?, views=?, active=1, gone_at=NULL, local=MAX(local,?), mkey=?, risky=?, skey=? WHERE id=?",
+              (it["price"], NOW, it["views"], loc_flag, key, risky, skey, it["id"]))
     return c.execute("SELECT * FROM listings WHERE id=?", (it["id"],)).fetchone(), False, dropped
 
 
 def valuation(c, row, minp):
-    comps = [r["price"] for r in c.execute(
-        "SELECT price FROM listings WHERE mkey=? AND active=1 AND risky=0 AND price>=? AND id!=?",
-        (row["mkey"], minp, row["id"]))]
-    gone = [r for r in c.execute(
-        "SELECT first_seen, gone_at FROM listings WHERE mkey=? AND active=0 AND gone_at>? AND price>=?",
-        (row["mkey"], NOW - 45 * 86400, minp))]
-    days = [(g["gone_at"] - g["first_seen"]) / 86400 for g in gone if (g["gone_at"] - g["first_seen"]) < 28 * 86400]
-    v = {"n_active": len(comps), "n_sold": len(days), "enough": len(comps) >= 5}
-    if v["enough"]:
-        v["median"] = int(statistics.median(comps))
-        v["sell"] = int(v["median"] * 0.93)  # asking prices are usually negotiated down
+    """Price estimate from comparable listings (same model AND memory/storage), cleaned of stale and outlier ads."""
+    sql = ("SELECT id,title,url,price,first_seen FROM listings WHERE {col}=? AND active=1 AND risky=0 "
+           "AND hidden=0 AND price>=? AND id!=?")
+    scope, col, key = "модель + память", "skey", row["skey"]
+    comps = c.execute(sql.format(col="skey"), (row["skey"], minp, row["id"])).fetchall() if row["skey"] and row["skey"] != row["mkey"] else []
+    if len(comps) < 5:
+        scope, col, key = "модель (память не указана)", "mkey", row["mkey"]
+        comps = c.execute(sql.format(col="mkey"), (row["mkey"], minp, row["id"])).fetchall()
+    fresh = [r for r in comps if r["first_seen"] > NOW - 30 * 86400]  # old unsold ads are overpriced
+    if len(fresh) >= 5:
+        comps = fresh
+    v = {"n_active": len(comps), "enough": False, "scope": scope}
+    if len(comps) >= 5:
+        med0 = statistics.median(r["price"] for r in comps)
+        comps = [r for r in comps if 0.5 * med0 <= r["price"] <= 1.6 * med0]  # drop outliers
+    sold = [r for r in c.execute(
+        f"SELECT price, first_seen, gone_at FROM listings WHERE {col}=? AND active=0 AND gone_at>? AND price>=?",
+        (key, NOW - 45 * 86400, minp)) if (r["gone_at"] - r["first_seen"]) < 28 * 86400]
+    days = [(r["gone_at"] - r["first_seen"]) / 86400 for r in sold]
+    if len(comps) >= 5:
+        prices = sorted(r["price"] for r in comps)
+        med = int(statistics.median(prices))
+        p30 = prices[int(0.3 * (len(prices) - 1))]
+        if len(sold) >= 3:  # prices of ads that actually disappeared are the most realistic
+            ref, basis = min(int(statistics.median(r["price"] for r in sold)), med), "по ценам реально исчезнувших объявлений"
+        else:
+            ref, basis = p30, "по нижним 30% предложений (дешевле всех продаётся быстрее)"
+        v.update(enough=True, n_active=len(comps), median=med, ref=ref, basis=basis, lo=prices[0], hi=prices[-1],
+                 sell=int(ref * 0.95), closest=sorted(comps, key=lambda r: abs(r["price"] - ref))[:3])
         v["profit"] = v["sell"] - (row["price"] or 0)
         v["margin"] = v["profit"] / max(row["price"] or 1, 1)
+    v["n_sold"] = len(days)
     if len(days) >= 3:
         md = statistics.median(days)
         v["days"] = md
@@ -301,7 +351,9 @@ def card(row, v, tag):
              f"💶 <b>{row['price']} €</b>  📍 {esc(row['loc'])}" + ("  (район Братиславы)" if row["local"] else ""),
              f"🏷 Модель: {esc(row['mkey'])}"]
     if v.get("enough"):
-        lines.append(f"📊 Медиана на Bazos: {v['median']} € ({v['n_active']} активных) → продажа ≈ {v['sell']} €")
+        lines.append(f"📊 Сравнил с {v['n_active']} похожими ({v['scope']}): {v['lo']}–{v['hi']} €, медиана {v['median']} €")
+        lines.append(f"🎯 Реалистичная цена продажи ≈ <b>{v['sell']} €</b> ({v['basis']}, −5% на торг)")
+        lines.append("🔎 Ближайшие: " + " · ".join(f'<a href="{r["url"]}">{r["price"]} €</a>' for r in v["closest"]))
         lines.append(f"💰 Ожидаемая прибыль ≈ <b>{v['profit']} €</b> ({int(v['margin'] * 100)} %)")
     else:
         lines.append(f"📊 Мало похожих объявлений ({v['n_active']}) — цена не проверена")
@@ -495,7 +547,7 @@ def top10_text(c, since, title):
             row_btns = []
     if row_btns:
         kb.append(row_btns)
-    lines.append("\n⭐ N — сохранить в избранное. Прибыль считается по медиане цен на Bazos с поправкой −7% на торг.")
+    lines.append("\n⭐ N — сохранить в избранное. Цена продажи — по похожим объявлениям (модель + память), без устаревших и выбросов, −5% на торг.")
     return "\n".join(lines)[:4000], json.dumps({"inline_keyboard": kb})
 
 
