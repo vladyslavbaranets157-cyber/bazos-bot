@@ -44,7 +44,18 @@ DEFAULTS = {
     "ignore": "",           # comma separated words
 }
 
-RISKY = re.compile(r"poškod|poskod|na diely|pokazen|pokaz|nefunk|icloud|zamknut|blokovan|defekt|rozbit|prasknut|zablokovan|bez dispej|nejde", re.I)
+RISKY = re.compile(r"poškod|poskod|na diely|na náhradn|pokazen|pokaz|nefunk|\bicloud\b|\bmdm\b|zamknut|zamknuť|blokovan|defekt|rozbit|prasknut|bez dispej|nejde|nezapn|nezapín|nenabíja|locked", re.I)
+# soft red flags: shown as warnings, listing is still considered
+SOFT_RED = [
+    (re.compile(r"bez nab[ií]ja[čc]k|bez adapt[ée]r|bez k[áa]bl", re.I), "без зарядки/кабеля"),
+    (re.compile(r"z[áa]loh|predplat|platb[ua] vopred|preddavok|vopred|len po[šs]tou|iba po[šs]tou|zasielam|kuri[ée]r|bez osobn", re.I),
+     "просит предоплату / только доставка — риск мошенничества"),
+]
+GREEN = [
+    (re.compile(r"fakt[úu]r|doklad|[úu]čtenk|pokladni[čc]n|z[áa]ruk", re.I), "есть чек/гарантия"),
+    (re.compile(r"krabic|krabic[ou]|origin[áa]lne balen|v balen[ií]|\bbox\b", re.I), "есть коробка"),
+    (re.compile(r"prv[ýy] majite|1\.?\s*majite|jeden majite|prv[ée]ho majite|od prv[ée]ho", re.I), "первый владелец"),
+]
 WANTED = re.compile(r"^\s*(kúpim|kupim|hľadám|hladam|zoženiem|zozenem|vykupujem|výkup|vykup)\b", re.I)
 
 
@@ -267,18 +278,39 @@ def valuation(c, row, minp):
     return v
 
 
+def flags(row, v):
+    text = (row["title"] or "") + " " + (row["descr"] or "")
+    reds, greens = [], []
+    if row["risky"]:
+        reds.append("в тексте: повреждён / на запчасти / iCloud / не включается — проверь!")
+    if v.get("enough") and row["price"] and row["price"] <= v["median"] * 0.5:
+        reds.append("слишком дёшево (−50% и больше от медианы) — часто мошенник или краденое")
+    for rx, label in SOFT_RED:
+        if rx.search(text):
+            reds.append(label)
+    for rx, label in GREEN:
+        if rx.search(text):
+            greens.append(label)
+    if len(row["descr"] or "") >= 150:
+        greens.append("подробное описание")
+    return reds, greens
+
+
 def card(row, v, tag):
     lines = [f"{tag} <b>{esc(row['title'])}</b>",
              f"💶 <b>{row['price']} €</b>  📍 {esc(row['loc'])}" + ("  (район Братиславы)" if row["local"] else ""),
              f"🏷 Модель: {esc(row['mkey'])}"]
-    if row["risky"]:
-        lines.append("⚠️ В тексте есть слова вроде «повреждён / на запчасти / iCloud» — проверь внимательно!")
     if v.get("enough"):
         lines.append(f"📊 Медиана на Bazos: {v['median']} € ({v['n_active']} активных) → продажа ≈ {v['sell']} €")
         lines.append(f"💰 Ожидаемая прибыль ≈ <b>{v['profit']} €</b> ({int(v['margin'] * 100)} %)")
     else:
         lines.append(f"📊 Мало похожих объявлений ({v['n_active']}) — цена не проверена")
     lines.append(f"⏱ Ликвидность: {v['liq']}" + (f", продаётся ~{v['days']:.0f} дн. ({v['n_sold']} продаж)" if "days" in v else ""))
+    reds, greens = flags(row, v)
+    for r in reds:
+        lines.append(f"🚩 {r}")
+    if greens:
+        lines.append("✅ " + ", ".join(greens))
     if row["descr"]:
         lines.append(f"📝 {esc(row['descr'][:220])}")
     return "\n".join(lines)
@@ -406,11 +438,77 @@ def stats_text(c):
 def report(c, chat):
     tg("sendMessage", chat_id=chat, text="☀️ <b>Утренний отчёт</b>\n\n" + top_text(c, 5) + "\n\n" + stats_text(c),
        parse_mode="HTML", reply_markup=MAIN_KB)
+    t, kb = top10_text(c, NOW - 86400, "Топ-10 за сутки (Братислава)")
+    send(chat, t, kb)
+
+
+# ---------- Bratislava top deals ----------
+LIQ_W = {"🔥": 1.0, "🟡": 0.8, "🧊": 0.6}
+
+
+def best_local(c, since=None, n=10):
+    """Rank active Bratislava listings seen so far by expected profit. Returns (items, checked_total, skipped)."""
+    q = "SELECT * FROM listings WHERE local=1"
+    args = []
+    if since:
+        q += " AND first_seen>=?"
+        args.append(since)
+    rows = c.execute(q, args).fetchall()
+    items, skipped = [], 0
+    for row in rows:
+        if not row["active"] or row["hidden"] or not row["price"]:
+            continue
+        term = next((t for t in TERMS if t[0] == row["term"]), None)
+        if not term or row["risky"] or WANTED.search(row["title"]) or ignored(c, row):
+            skipped += 1
+            continue
+        v = valuation(c, row, term[1])
+        if not v.get("enough") or v["profit"] < 10 or v["margin"] < 0.1:
+            continue
+        reds, greens = flags(row, v)
+        if row["price"] <= v["median"] * 0.5:  # suspiciously cheap: not ranked
+            skipped += 1
+            continue
+        w = LIQ_W.get(v["liq"][:1], 0.8)
+        score = v["profit"] * w - 15 * len(reds) + 5 * len(greens)
+        items.append((score, row, v, reds, greens))
+    items.sort(key=lambda x: -x[0])
+    return items[:n], len(rows), skipped
+
+
+def top10_text(c, since, title):
+    items, checked, skipped = best_local(c, since)
+    head = f"🏆 <b>{title}</b>\nПроверено объявлений в Братиславе: {checked}" + (f" (отсеяно подозрительных: {skipped})" if skipped else "")
+    if not items:
+        return head + "\n\nПока нет объявлений с понятной прибылью. Нужно больше данных — бот копит статистику.", None
+    lines, kb, row_btns = [head, ""], [], []
+    for i, (score, row, v, reds, greens) in enumerate(items, 1):
+        lines.append(f"<b>{i}. <a href=\"{row['url']}\">{esc(row['title'][:60])}</a></b>")
+        lines.append(f"   💶 {row['price']} € → продажа ≈ {v['sell']} € · 💰 <b>+{v['profit']} €</b> ({int(v['margin'] * 100)} %) · {v['liq'].split(' (')[0]}")
+        if reds:
+            lines.append("   🚩 " + "; ".join(reds)[:140])
+        if greens:
+            lines.append("   ✅ " + ", ".join(greens))
+        row_btns.append({"text": f"⭐ {i}", "callback_data": f"save:{row['id']}"})
+        if len(row_btns) == 5:
+            kb.append(row_btns)
+            row_btns = []
+    if row_btns:
+        kb.append(row_btns)
+    lines.append("\n⭐ N — сохранить в избранное. Прибыль считается по медиане цен на Bazos с поправкой −7% на торг.")
+    return "\n".join(lines)[:4000], json.dumps({"inline_keyboard": kb})
+
+
+def top10_menu():
+    return ("🏆 <b>Топ-10 Братислава</b>\nВыбери период:",
+            json.dumps({"inline_keyboard": [[{"text": "📅 За сутки", "callback_data": "top10:day"},
+                                             {"text": "🗂 За всё время", "callback_data": "top10:all"}]]}))
 
 
 # ---------- UI ----------
-MAIN_KB = json.dumps({"keyboard": [["📊 Статистика", "🔥 Топ моделей"], ["💰 Бюджет", "🎯 Цель"],
-                                    ["🧾 Мои сделки", "⭐ Избранное"], ["⚙️ Настройки"]], "resize_keyboard": True})
+MAIN_KB = json.dumps({"keyboard": [["📊 Статистика", "🔥 Топ моделей"], ["🏆 Топ-10 Братислава"],
+                                    ["💰 Бюджет", "🎯 Цель"], ["🧾 Мои сделки", "⭐ Избранное"], ["⚙️ Настройки"]],
+                      "resize_keyboard": True})
 NUM = {  # key: (title, presets, unit)
     "budget": ("💰 Бюджет на покупку", [100, 200, 300, 500, 700, 1000, 1500], "€"),
     "goal": ("🎯 Цель на месяц (прибыль)", [300, 500, 800, 1000, 1500], "€"),
@@ -587,7 +685,7 @@ def on_text(c, chat, text):
     pending = meta_get(c, "await", "")
     # a menu button always cancels a pending text input
     buttons = {"📊 Статистика": "stats", "🔥 Топ моделей": "top", "💰 Бюджет": "budget", "🎯 Цель": "goal",
-               "🧾 Мои сделки": "trades", "⭐ Избранное": "fav", "⚙️ Настройки": "settings"}
+               "🧾 Мои сделки": "trades", "⭐ Избранное": "fav", "⚙️ Настройки": "settings", "🏆 Топ-10 Братислава": "top10"}
     if text in buttons:
         meta_set(c, "await", "")
         b = buttons[text]
@@ -595,6 +693,9 @@ def on_text(c, chat, text):
             send(chat, stats_text(c), MAIN_KB)
         elif b == "top":
             send(chat, top_text(c), MAIN_KB)
+        elif b == "top10":
+            t, kb = top10_menu()
+            send(chat, t, kb)
         else:
             open_menu(c, chat, None, b)
         return
@@ -625,7 +726,7 @@ def on_text(c, chat, text):
             return open_menu(c, chat, None, "settings")
         return send(chat, "Не понял. Введи число (или текст для названия) либо выбери кнопку.", MAIN_KB)
     if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
-        meta_set(c, "kb_v", "2")
+        meta_set(c, "kb_v", "3")
         return send(chat, WELCOME, MAIN_KB)
     send(chat, "Выбери действие кнопками внизу 👇", MAIN_KB)
 
@@ -667,6 +768,10 @@ def on_callback(c, chat, cq):
                                 (r["title"][:60], r["price"], NOW, int(rest)))
                 kb = json.dumps({"inline_keyboard": [[{"text": "✏️ Изменить / 🗑 Отменить", "callback_data": f"tr:{cur.lastrowid}"}]]})
                 send(chat, f"📥 Записал покупку: {esc(r['title'][:60])} за <b>{r['price']} €</b>.\nНажал случайно? Кнопка ниже отменит запись.", kb)
+    elif act == "top10":
+        t, kb = top10_text(c, NOW - 86400 if rest == "day" else None,
+                           "Топ-10 за сутки (Братислава)" if rest == "day" else "Топ-10 за всё время (Братислава)")
+        send(chat, t, kb)
     elif act == "ign":
         c.execute("UPDATE listings SET hidden=1 WHERE id=?", (int(rest),))
     elif act == "save":
@@ -731,9 +836,9 @@ def process_updates(c, wait=0):
             else:
                 on_text(c, chat, text)
         c.commit()
-    if chat and meta_get(c, "kb_v") != "2":
-        meta_set(c, "kb_v", "2")
-        send(chat, "🔄 Бот обновлён: добавлены «⭐ Избранное» и редактирование сделок (нажми на сделку в «🧾 Мои сделки») 👇", MAIN_KB)
+    if chat and meta_get(c, "kb_v") != "3":
+        meta_set(c, "kb_v", "3")
+        send(chat, "🔄 Бот обновлён: кнопка «🏆 Топ-10 Братислава» и красные/зелёные флаги в карточках 👇", MAIN_KB)
     return chat
 
 
