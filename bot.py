@@ -151,6 +151,10 @@ def db_open():
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, buy INTEGER, sell INTEGER,
       bought_at INTEGER, sold_at INTEGER);
     """)
+    try:
+        c.execute("ALTER TABLE listings ADD COLUMN hidden INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     return c
 
 
@@ -252,41 +256,50 @@ def valuation(c, row, minp):
     if len(days) >= 3:
         md = statistics.median(days)
         v["days"] = md
-        v["liq"] = "🔥 vysoká" if md <= 5 else "🟡 stredná" if md <= 14 else "🧊 nízka"
+        v["liq"] = "🔥 высокая" if md <= 5 else "🟡 средняя" if md <= 14 else "🧊 низкая"
     else:
-        v["liq"] = "❔ málo dát (zbieram štatistiku)"
+        v["liq"] = "❔ мало данных (бот копит статистику)"
     return v
 
 
 def card(row, v, tag):
     lines = [f"{tag} <b>{esc(row['title'])}</b>",
-             f"💶 <b>{row['price']} €</b>  📍 {esc(row['loc'])}" + ("  (okolie BA)" if row["local"] else ""),
-             f"🏷 {esc(row['mkey'])}"]
+             f"💶 <b>{row['price']} €</b>  📍 {esc(row['loc'])}" + ("  (район Братиславы)" if row["local"] else ""),
+             f"🏷 Модель: {esc(row['mkey'])}"]
     if row["risky"]:
-        lines.append("⚠️ v texte sú slová ako poškodený/na diely/iCloud – skontroluj!")
+        lines.append("⚠️ В тексте есть слова вроде «повреждён / на запчасти / iCloud» — проверь внимательно!")
     if v.get("enough"):
-        lines.append(f"📊 medián na Bazoši: {v['median']} € ({v['n_active']} aktívnych) → predaj ~{v['sell']} €")
-        lines.append(f"💰 zisk ≈ <b>{v['profit']} €</b> ({int(v['margin'] * 100)} %)")
+        lines.append(f"📊 Медиана на Bazos: {v['median']} € ({v['n_active']} активных) → продажа ≈ {v['sell']} €")
+        lines.append(f"💰 Ожидаемая прибыль ≈ <b>{v['profit']} €</b> ({int(v['margin'] * 100)} %)")
     else:
-        lines.append(f"📊 málo porovnateľných ponúk ({v['n_active']}) – cena nie je overená")
-    lines.append(f"⏱ likvidita: {v['liq']}" + (f", predáva sa ~{v['days']:.0f} dní ({v['n_sold']} predajov)" if "days" in v else ""))
+        lines.append(f"📊 Мало похожих объявлений ({v['n_active']}) — цена не проверена")
+    lines.append(f"⏱ Ликвидность: {v['liq']}" + (f", продаётся ~{v['days']:.0f} дн. ({v['n_sold']} продаж)" if "days" in v else ""))
     if row["descr"]:
         lines.append(f"📝 {esc(row['descr'][:220])}")
-    lines.append(f"🔗 {row['url']}")
-    lines.append(f"/ignore_{row['id']}")
     return "\n".join(lines)
+
+
+def card_kb(row):
+    return json.dumps({"inline_keyboard": [
+        [{"text": "🔗 Открыть объявление", "url": row["url"]}],
+        [{"text": "✅ Купил", "callback_data": f"buy:{row['id']}"},
+         {"text": "🚫 Не показывать", "callback_data": f"ign:{row['id']}"}]]})
 
 
 def send_card(chat, row, v, tag):
     text = card(row, v, tag)
+    kb = card_kb(row)
     if row["img"] and "empty.gif" not in row["img"]:
-        r = tg("sendPhoto", chat_id=chat, photo=row["img"], caption=text[:1000], parse_mode="HTML")
+        r = tg("sendPhoto", chat_id=chat, photo=row["img"], caption=text[:1000], parse_mode="HTML", reply_markup=kb)
         if r and r.get("ok"):
             return
-    tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML")
+    tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML", reply_markup=kb)
 
 
-def ignored(c, title):
+def ignored(c, row):
+    if row["hidden"]:
+        return True
+    title = row["title"]
     words = [w.strip().lower() for w in cfg(c, "ignore").split(",") if w.strip()]
     t = title.lower()
     return any(w in t for w in words)
@@ -301,14 +314,14 @@ def scan_local_macs(c, chat):
         if it["price"] is None or it["price"] < minp or WANTED.search(it["title"]):
             continue
         row, new, dropped = upsert(c, it, term, keyfn, minp, True)
-        if ignored(c, row["title"]):
+        if ignored(c, row):
             continue
         if (new or dropped) and (row["notified_price"] is None or dropped):
             if not re.search(r"m[1-4]|air|pro", row["title"], re.I):
                 continue
             v = valuation(c, row, minp)
             if chat and not quiet:
-                send_card(chat, row, v, "🆕 MacBook BA" if new else "📉 zlacnel")
+                send_card(chat, row, v, "🆕 MacBook в Братиславе" if new else "📉 Цена снижена")
             if chat:
                 c.execute("UPDATE listings SET notified_price=? WHERE id=?", (row["price"], row["id"]))
             c.commit()
@@ -326,7 +339,7 @@ def scan_market_term(c, chat):
         if it["price"] is None or it["price"] < minp or WANTED.search(it["title"]):
             continue
         row, new, dropped = upsert(c, it, term, keyfn, minp, False)
-        if row["risky"] or ignored(c, row["title"]):
+        if row["risky"] or ignored(c, row):
             continue
         if not ((new or dropped) and (row["notified_price"] is None or dropped)):
             continue
@@ -335,9 +348,9 @@ def scan_market_term(c, chat):
             continue
         tag = None
         if row["price"] <= budget and v["profit"] >= minprofit and v["margin"] >= 0.15:
-            tag = "💸 výhodná ponuka"
+            tag = "💸 Выгодное предложение"
         elif row["price"] > budget and v["profit"] >= bigprofit and v["margin"] >= 0.2:
-            tag = "💎 veľký obchod"
+            tag = "💎 Крупная сделка"
         if tag and chat:
             send_card(chat, row, v, tag)
             c.execute("UPDATE listings SET notified_price=? WHERE id=?", (row["price"], row["id"]))
@@ -359,25 +372,18 @@ def check_gone(c, limit=20):
 
 # ---------- reports ----------
 def top_liquid(c, n=5):
-    rows = c.execute("""SELECT mkey, COUNT(*) n, AVG(gone_at-first_seen)/86400.0 d, AVG(price) p
+    return c.execute("""SELECT mkey, COUNT(*) n, AVG(gone_at-first_seen)/86400.0 d, AVG(price) p
                         FROM listings WHERE active=0 AND gone_at>? AND gone_at-first_seen<?
                         GROUP BY mkey HAVING n>=3 ORDER BY d ASC LIMIT ?""",
                      (NOW - 30 * 86400, 28 * 86400, n)).fetchall()
-    return rows
 
 
-def report(c, chat):
-    lines = ["☀️ <b>Ranný report</b>", ""]
-    tops = top_liquid(c)
-    if tops:
-        lines.append("🔥 <b>Najlikvidnejšie modely (30 dní):</b>")
-        for r in tops:
-            lines.append(f"• {esc(r['mkey'])} – ~{r['d']:.1f} dní, {r['n']} predajov, priem. {int(r['p'])} €")
-    else:
-        lines.append("Zatiaľ málo dát o predajoch – bot sa učí (potrebuje pár dní).")
-    lines.append("")
-    lines.append(stats_text(c))
-    tg("sendMessage", chat_id=chat, text="\n".join(lines), parse_mode="HTML")
+def top_text(c, n=8):
+    tops = top_liquid(c, n)
+    if not tops:
+        return "🔥 <b>Топ ликвидных моделей</b>\n\nПока мало данных о продажах — бот копит статистику (нужно несколько дней)."
+    return "\n".join(["🔥 <b>Самые ликвидные модели (30 дней)</b>"] + [
+        f"• {esc(r['mkey'])} — ~{r['d']:.1f} дн., {r['n']} продаж, ср. цена {int(r['p'])} €" for r in tops])
 
 
 def stats_text(c):
@@ -386,92 +392,188 @@ def stats_text(c):
     openi = c.execute("SELECT COUNT(*) n, COALESCE(SUM(buy),0) s FROM trades WHERE sold_at IS NULL").fetchone()
     goal = int(cfg(c, "goal"))
     pct = int(closed["p"] / goal * 100) if goal else 0
-    return (f"🎯 <b>Cieľ mesiaca:</b> {closed['p']} / {goal} € ({pct} %)\n"
-            f"✅ uzavreté obchody: {closed['n']}\n"
-            f"📦 na sklade: {openi['n']} ks za {openi['s']} €")
+    return (f"🎯 <b>Цель месяца:</b> {closed['p']} / {goal} € ({pct} %)\n"
+            f"✅ Закрытых сделок: {closed['n']}\n"
+            f"📦 На складе: {openi['n']} шт. на {openi['s']} €")
 
 
-HELP = """<b>Príkazy</b>
-/budget 300 – max. nákupná cena
-/minprofit 30 – min. očakávaný zisk (€)
-/bigprofit 120 – zisk pre „veľké obchody“ nad budgetom
-/goal 500 – mesačný cieľ
-/bought 280 MacBook Air M1 – zapíš nákup
-/sold 350 MacBook Air M1 – zapíš predaj
-/stats – pokrok k cieľu
-/top – najlikvidnejšie modely
-/ignore slovo – ignoruj slovo v názve, /unignore slovo, /ignored
-/status – stav bota"""
+def report(c, chat):
+    tg("sendMessage", chat_id=chat, text="☀️ <b>Утренний отчёт</b>\n\n" + top_text(c, 5) + "\n\n" + stats_text(c),
+       parse_mode="HTML", reply_markup=MAIN_KB)
 
 
-def handle_command(c, chat, text):
-    text = text.strip()
-    m = re.match(r"^/(\w+)(?:@\w+)?\s*(.*)$", text, re.S)
-    if not m:
-        return
-    cmd, arg = m.group(1).lower(), m.group(2).strip()
+# ---------- UI ----------
+MAIN_KB = json.dumps({"keyboard": [["📊 Статистика", "🔥 Топ моделей"], ["💰 Бюджет", "🎯 Цель"],
+                                    ["🧾 Мои сделки", "⚙️ Настройки"]], "resize_keyboard": True})
+NUM = {  # key: (title, presets, unit)
+    "budget": ("💰 Бюджет на покупку", [100, 200, 300, 500, 700, 1000, 1500], "€"),
+    "goal": ("🎯 Цель на месяц (прибыль)", [300, 500, 800, 1000, 1500], "€"),
+    "min_profit": ("📈 Мин. прибыль для оповещения", [15, 25, 40, 60, 80], "€"),
+    "big_profit": ("💎 Мин. прибыль для крупных сделок", [80, 100, 150, 250, 400], "€"),
+}
 
-    def reply(s):
-        tg("sendMessage", chat_id=chat, text=s, parse_mode="HTML", disable_web_page_preview="true")
 
-    def setnum(key, label):
-        if re.fullmatch(r"\d+", arg):
-            meta_set(c, "cfg_" + key, arg)
-            reply(f"✅ {label}: {arg} €")
-        else:
-            reply(f"Aktuálne {label}: {cfg(c, key)} €. Zmena: /{cmd} 300")
+def num_menu(c, key):
+    title, presets, unit = NUM[key]
+    rows, row = [], []
+    for p in presets:
+        row.append({"text": f"{p} €", "callback_data": f"set:{key}:{p}"})
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "➖ 50", "callback_data": f"adj:{key}:-50"}, {"text": "➕ 50", "callback_data": f"adj:{key}:50"}])
+    rows.append([{"text": "✍️ Своё число", "callback_data": f"ask:{key}"}, {"text": "⬅️ Настройки", "callback_data": "menu:settings"}])
+    return f"{title}\nСейчас: <b>{cfg(c, key)} {unit}</b>\nВыбери значение:", json.dumps({"inline_keyboard": rows})
 
-    if cmd in ("start", "help"):
-        reply("👋 Ahoj! Sledujem Bazoš a hľadám výhodné ponuky na prepredaj.\n\n" + HELP)
-    elif cmd == "budget":
-        setnum("budget", "budget")
-    elif cmd == "minprofit":
-        setnum("min_profit", "min. zisk")
-    elif cmd == "bigprofit":
-        setnum("big_profit", "zisk pre veľké obchody")
-    elif cmd == "goal":
-        setnum("goal", "mesačný cieľ")
-    elif cmd in ("bought", "sold"):
-        mm = re.match(r"(\d+)\s+(.+)", arg)
-        if not mm:
-            return reply(f"Použitie: /{cmd} 280 MacBook Air M1")
-        price, name = int(mm.group(1)), mm.group(2).strip()
-        if cmd == "bought":
-            c.execute("INSERT INTO trades(name,buy,bought_at) VALUES(?,?,?)", (name, price, NOW))
-            reply(f"📥 Nákup zapísaný: {esc(name)} za {price} €")
-        else:
-            t = c.execute("SELECT * FROM trades WHERE sold_at IS NULL AND LOWER(name) LIKE ? ORDER BY bought_at LIMIT 1",
-                          ("%" + name.lower() + "%",)).fetchone()
-            if not t:
-                return reply("Nenašiel som taký nákup. Najprv /bought.")
-            c.execute("UPDATE trades SET sell=?, sold_at=? WHERE id=?", (price, NOW, t["id"]))
-            reply(f"📤 Predaj: {esc(t['name'])} → zisk <b>{price - t['buy']} €</b>\n\n" + stats_text(c))
-    elif cmd == "stats":
-        reply(stats_text(c))
-    elif cmd == "top":
-        tops = top_liquid(c, 8)
-        reply("\n".join(["🔥 <b>Najlikvidnejšie modely</b>"] + [f"• {esc(r['mkey'])} – ~{r['d']:.1f} dní, {r['n']} predajov, priem. {int(r['p'])} €" for r in tops])
-              if tops else "Zatiaľ málo dát.")
-    elif cmd == "ignore":
-        if arg:
-            words = [w for w in cfg(c, "ignore").split(",") if w] + [arg.lower()]
-            meta_set(c, "cfg_ignore", ",".join(dict.fromkeys(words)))
-            reply(f"🚫 Ignorujem: {esc(arg)}")
-    elif cmd == "unignore":
-        words = [w for w in cfg(c, "ignore").split(",") if w and w != arg.lower()]
-        meta_set(c, "cfg_ignore", ",".join(words))
-        reply("✅ Odstránené")
-    elif cmd == "ignored":
-        reply("🚫 " + (cfg(c, "ignore") or "(nič)"))
-    elif cmd.startswith("ignore_") or re.match(r"ignore_\d+", cmd):
-        pass
-    elif cmd == "status":
-        n = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-        a = c.execute("SELECT COUNT(*) FROM listings WHERE active=1").fetchone()[0]
-        g = c.execute("SELECT COUNT(*) FROM listings WHERE active=0").fetchone()[0]
-        reply(f"🤖 beží. Inzerátov v DB: {n} (aktívne {a}, zmizli {g}). Budget {cfg(c, 'budget')} €, min. zisk {cfg(c, 'min_profit')} €")
+
+def settings_menu(c):
+    ig = cfg(c, "ignore") or "—"
+    text = (f"⚙️ <b>Настройки</b>\n\n💰 Бюджет: <b>{cfg(c, 'budget')} €</b>\n📈 Мин. прибыль: <b>{cfg(c, 'min_profit')} €</b>\n"
+            f"💎 Крупные сделки от: <b>{cfg(c, 'big_profit')} €</b>\n🎯 Цель месяца: <b>{cfg(c, 'goal')} €</b>\n🚫 Игнор-слова: {esc(ig)}")
+    kb = {"inline_keyboard": [
+        [{"text": "💰 Бюджет", "callback_data": "menu:budget"}, {"text": "🎯 Цель", "callback_data": "menu:goal"}],
+        [{"text": "📈 Мин. прибыль", "callback_data": "menu:min_profit"}, {"text": "💎 Крупные сделки", "callback_data": "menu:big_profit"}],
+        [{"text": "🚫 Добавить игнор-слово", "callback_data": "ask:ignore"}, {"text": "🗑 Очистить игнор", "callback_data": "clear:ignore"}],
+        [{"text": "ℹ️ Статус бота", "callback_data": "menu:status"}]]}
+    return text, json.dumps(kb)
+
+
+def trades_menu(c):
+    rows = c.execute("SELECT id,name,buy FROM trades WHERE sold_at IS NULL ORDER BY bought_at DESC LIMIT 10").fetchall()
+    text = "🧾 <b>Мои сделки</b>\n\n" + stats_text(c)
+    kb = [[{"text": f"📤 Продал: {r['name'][:28]} ({r['buy']} €)", "callback_data": f"sell:{r['id']}"}] for r in rows]
+    if rows:
+        text += "\n\nНажми на товар, который продал, и введи цену продажи."
     else:
-        reply("Neznámy príkaz.\n\n" + HELP)
+        text += "\n\nПока нет купленных товаров. Нажми «✅ Купил» под карточкой объявления."
+    return text, json.dumps({"inline_keyboard": kb}) if kb else None
+
+
+def status_text(c):
+    n = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    a = c.execute("SELECT COUNT(*) FROM listings WHERE active=1").fetchone()[0]
+    g = c.execute("SELECT COUNT(*) FROM listings WHERE active=0").fetchone()[0]
+    return f"🤖 Бот работает.\nОбъявлений в базе: {n} (активных {a}, исчезло {g}).\nБюджет {cfg(c, 'budget')} €, мин. прибыль {cfg(c, 'min_profit')} €."
+
+
+WELCOME = ("👋 Привет! Я слежу за Bazos.sk и ищу выгодные товары для перепродажи.\n\n"
+           "• Новые MacBook в Братиславе +25 км приходят сразу.\n"
+           "• По всему рынку ищу товары дешевле медианы и считаю прибыль и ликвидность.\n"
+           "• Всё управление — кнопками внизу и под карточками.")
+
+
+def send(chat, text, kb=None):
+    p = dict(chat_id=chat, text=text, parse_mode="HTML", disable_web_page_preview="true")
+    if kb:
+        p["reply_markup"] = kb
+    return tg("sendMessage", **p)
+
+
+def show(chat, msg_id, text, kb=None):
+    """Edit the menu message in place if possible, otherwise send a new one."""
+    if msg_id:
+        p = dict(chat_id=chat, message_id=msg_id, text=text, parse_mode="HTML", disable_web_page_preview="true")
+        if kb:
+            p["reply_markup"] = kb
+        r = tg("editMessageText", **p)
+        if r and (r.get("ok") or "not modified" in str(r.get("description", ""))):
+            return
+    send(chat, text, kb)
+
+
+def open_menu(c, chat, msg_id, name):
+    if name in NUM:
+        t, kb = num_menu(c, name)
+    elif name == "settings":
+        t, kb = settings_menu(c)
+    elif name == "trades":
+        t, kb = trades_menu(c)
+    elif name == "status":
+        t, kb = status_text(c), None
+    else:
+        return
+    show(chat, msg_id, t, kb)
+
+
+def set_num(c, key, val):
+    meta_set(c, "cfg_" + key, max(0, int(val)))
+
+
+def on_text(c, chat, text):
+    text = text.strip()
+    pending = meta_get(c, "await", "")
+    # a menu button always cancels a pending text input
+    buttons = {"📊 Статистика": "stats", "🔥 Топ моделей": "top", "💰 Бюджет": "budget", "🎯 Цель": "goal",
+               "🧾 Мои сделки": "trades", "⚙️ Настройки": "settings"}
+    if text in buttons:
+        meta_set(c, "await", "")
+        b = buttons[text]
+        if b == "stats":
+            send(chat, stats_text(c), MAIN_KB)
+        elif b == "top":
+            send(chat, top_text(c), MAIN_KB)
+        else:
+            open_menu(c, chat, None, b)
+        return
+    if pending:
+        meta_set(c, "await", "")
+        kind, _, arg = pending.partition(":")
+        if kind == "num" and re.fullmatch(r"\d{1,6}", text):
+            set_num(c, arg, text)
+            return open_menu(c, chat, None, arg)
+        if kind == "sell" and re.fullmatch(r"\d{1,6}", text):
+            t = c.execute("SELECT * FROM trades WHERE id=?", (int(arg),)).fetchone()
+            if t:
+                c.execute("UPDATE trades SET sell=?, sold_at=? WHERE id=?", (int(text), NOW, t["id"]))
+                return send(chat, f"📤 Продано: {esc(t['name'])}\n💰 Прибыль: <b>{int(text) - t['buy']} €</b>\n\n" + stats_text(c), MAIN_KB)
+        if kind == "ignore" and text:
+            words = [w for w in cfg(c, "ignore").split(",") if w] + [text.lower()]
+            meta_set(c, "cfg_ignore", ",".join(dict.fromkeys(words)))
+            return open_menu(c, chat, None, "settings")
+        return send(chat, "Не понял. Введи число или выбери кнопку.", MAIN_KB)
+    if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
+        meta_set(c, "kb_v", "1")
+        return send(chat, WELCOME, MAIN_KB)
+    send(chat, "Выбери действие кнопками внизу 👇", MAIN_KB)
+
+
+def on_callback(c, chat, cq):
+    data = cq.get("data", "")
+    msg = cq.get("message") or {}
+    mid = msg.get("message_id")
+    tg("answerCallbackQuery", callback_query_id=cq["id"])
+    act, _, rest = data.partition(":")
+    if act == "menu":
+        open_menu(c, chat, mid, rest)
+    elif act == "set":
+        key, _, val = rest.partition(":")
+        set_num(c, key, val)
+        open_menu(c, chat, mid, key)
+    elif act == "adj":
+        key, _, d = rest.partition(":")
+        set_num(c, key, int(cfg(c, key)) + int(d))
+        open_menu(c, chat, mid, key)
+    elif act == "ask":
+        meta_set(c, "await", ("ignore" if rest == "ignore" else "num:" + rest))
+        send(chat, "✍️ Напиши слово для игнора (например: «чехол»):" if rest == "ignore" else "✍️ Напиши число в евро:")
+    elif act == "clear" and rest == "ignore":
+        meta_set(c, "cfg_ignore", "")
+        open_menu(c, chat, mid, "settings")
+    elif act == "buy":
+        r = c.execute("SELECT title, price FROM listings WHERE id=?", (int(rest),)).fetchone()
+        if r:
+            c.execute("INSERT INTO trades(name,buy,bought_at) VALUES(?,?,?)", (r["title"][:60], r["price"], NOW))
+            send(chat, f"📥 Записал покупку: {esc(r['title'][:60])} за <b>{r['price']} €</b>.\nКогда продашь — «🧾 Мои сделки».", MAIN_KB)
+    elif act == "ign":
+        c.execute("UPDATE listings SET hidden=1 WHERE id=?", (int(rest),))
+        send(chat, "🚫 Больше не показываю это объявление.")
+    elif act == "sell":
+        t = c.execute("SELECT name,buy FROM trades WHERE id=?", (int(rest),)).fetchone()
+        if t:
+            meta_set(c, "await", "sell:" + rest)
+            send(chat, f"📤 За сколько продал «{esc(t['name'])}» (куплено за {t['buy']} €)? Напиши число в евро:")
     c.commit()
 
 
@@ -481,9 +583,11 @@ def process_updates(c):
     if r and r.get("ok"):
         for u in r["result"]:
             meta_set(c, "tg_offset", u["update_id"] + 1)
-            msg = u.get("message") or {}
-            text, cid = msg.get("text", ""), str(msg.get("chat", {}).get("id", ""))
-            if not text or not cid:
+            cq = u.get("callback_query")
+            msg = u.get("message") or (cq or {}).get("message") or {}
+            cid = str(msg.get("chat", {}).get("id", ""))
+            text = (u.get("message") or {}).get("text", "")
+            if not cid or not (text or cq):
                 continue
             if not chat:  # first /start claims the bot
                 if text.startswith("/start"):
@@ -493,14 +597,14 @@ def process_updates(c):
                     continue
             if cid != chat:
                 continue
-            mm = re.match(r"^/ignore_(\d+)", text)
-            if mm:
-                row = c.execute("SELECT title FROM listings WHERE id=?", (int(mm.group(1)),)).fetchone()
-                c.execute("UPDATE listings SET risky=1 WHERE id=?", (int(mm.group(1)),))
-                tg("sendMessage", chat_id=chat, text="🚫 Ignorované" + (": " + esc(row["title"]) if row else ""), parse_mode="HTML")
-                continue
-            handle_command(c, chat, text)
+            if cq:
+                on_callback(c, chat, cq)
+            else:
+                on_text(c, chat, text)
         c.commit()
+    if chat and meta_get(c, "kb_v") != "1":
+        meta_set(c, "kb_v", "1")
+        send(chat, "🔄 Бот обновлён: теперь всё на русском и управляется кнопками внизу 👇", MAIN_KB)
     return chat
 
 
