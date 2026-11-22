@@ -16,8 +16,15 @@ try:
 except ImportError:
     sys.exit("Сначала выполни: python3 -m pip install --user telethon")
 
-api_id = int(input("api_id: ").strip())
-api_hash = getpass.getpass("api_hash (ввод скрыт): ").strip()
+import re
+
+api_id_s = input("api_id (только цифры): ").strip()
+api_hash = input("api_hash (32 символа 0-9 a-f): ").strip()
+if not api_id_s.isdigit():
+    sys.exit("api_id должен состоять только из цифр (например 1234567). Проверь на my.telegram.org.")
+if not re.fullmatch(r"[0-9a-f]{32}", api_hash):
+    sys.exit(f"api_hash должен быть ровно 32 символа из 0-9 и a-f, у тебя {len(api_hash)}. Скопируй его заново, без пробелов.")
+api_id = int(api_id_s)
 with TelegramClient(StringSession(), api_id, api_hash) as client:  # asks phone, code, 2FA in the terminal
     session = client.session.save()
     me = client.get_me()
