@@ -104,7 +104,18 @@ TERMS = [
     ("dji", 60, _re_key("DJI", r"(mini\s*\d?|mavic\s*\w*|osmo\s*\w*|air\s*\d|pocket\s*\d)")),
     ("gopro", 60, _re_key("GoPro", r"hero\s*(\d+)")),
     ("samsung galaxy s", 80, _re_key("Galaxy S", r"\bs\s?(\d{2})")),
+    ("mac mini", 150, _re_key("Mac mini", r"(m[1-4]|intel)")),
+    ("imac", 200, _re_key("iMac", r"(m[1-4]|\d{2}\")")),
+    ("thinkpad", 100, _re_key("ThinkPad", r"(t\d{2,3}\w?|x1 carbon|x\d{3}|p\d{2})")),
+    ("radeon rx", 60, _re_key("GPU RX", r"rx\s*(\d{4}\s*(?:xt)?)")),
+    ("rog ally", 250, _fixed("ROG Ally")),
+    ("meta quest", 100, _re_key("Meta Quest", r"quest\s*(\d|pro)")),
+    ("sony wh-1000xm", 60, _re_key("Sony WH-1000XM", r"xm\s*([3-6])")),
+    ("sony alpha", 250, _re_key("Sony Alpha", r"(a7\w*|a6\d{3}|a9\w*|zv-?e?\d+)")),
+    ("canon eos", 150, _re_key("Canon EOS", r"(r\d+\w*|\d{2,4}d|rp)")),
+    ("garmin", 80, _re_key("Garmin", r"(fenix\s*\d+\w*|forerunner\s*\d+|venu\s*\d*)")),
 ]
+APPLE_TERMS = {"macbook", "iphone", "ipad", "apple watch", "airpods", "mac mini", "imac"}
 
 
 def specs(term, text):
@@ -237,7 +248,12 @@ def parse_page(page):
         zp = re.search(r"\b(\d{3}\s?\d{2})\b", loc_s)
         img = re.search(r'<img src="(https://www\.bazos\.sk/img/[^"]+)"', blk)
         v = re.search(r'class="inzeratyview">\s*(\d+)', blk)
-        out.append(dict(id=lid, url=url, title=title, descr=descr[:300], price=price, loc=loc_s,
+        dm = re.search(r"\[\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})\s*\]", blk)
+        try:
+            posted = datetime(int(dm.group(3)), int(dm.group(2)), int(dm.group(1)), tzinfo=TZ).date() if dm else None
+        except ValueError:
+            posted = None
+        out.append(dict(id=lid, url=url, title=title, posted=posted, descr=descr[:300], price=price, loc=loc_s,
                         zip=zp.group(1).replace(" ", "") if zp else "", img=img.group(1) if img else "",
                         views=int(v.group(1)) if v else 0))
     return out
@@ -396,55 +412,73 @@ def ignored(c, row):
 
 
 # ---------- scanning ----------
-def scan_local_macs(c, chat):
-    budget = int(cfg(c, "budget"))
-    term, minp, keyfn = TERMS[0]
-    quiet = meta_get(c, "seed_local") is None  # first pass: just remember what exists
-    for it in search("macbook", pages=2, local=True, max_price=budget):
-        if it["price"] is None or it["price"] < minp or WANTED.search(it["title"]):
-            continue
-        row, new, dropped = upsert(c, it, term, keyfn, minp, True)
-        if ignored(c, row):
-            continue
-        if (new or dropped) and (row["notified_price"] is None or dropped):
-            if not re.search(r"m[1-4]|air|pro", row["title"], re.I):
+def relevant(term, title):
+    """Bazos search is fuzzy: keep only ads whose title contains every word of the search term."""
+    t = title.lower().replace("  ", " ")
+    return all(w in t for w in term.split())
+
+
+def is_fresh(it):
+    """Bazos shows only the date: accept ads posted today or yesterday."""
+    if not it.get("posted"):
+        return True
+    return (datetime.now(TZ).date() - it["posted"]).days <= 1
+
+
+def alert_tag(row, v, budget, minprofit, bigprofit):
+    if v.get("enough"):
+        if row["price"] <= budget and v["profit"] >= minprofit and v["margin"] >= 0.15:
+            return "💸 Свежее предложение"
+        if row["price"] > budget and v["profit"] >= bigprofit and v["margin"] >= 0.2:
+            return "💎 Крупная сделка"
+        return None
+    if row["term"] in APPLE_TERMS and row["price"] <= budget:
+        return "🍎 Свежее (цена пока не проверена)"
+    return None
+
+
+def scan_local_all(c, chat, max_alerts=8):
+    """Newest ads in Bratislava +25 km for every tech term -> instant Telegram alerts (only fresh ones)."""
+    budget, minprofit, bigprofit = int(cfg(c, "budget")), int(cfg(c, "min_profit")), int(cfg(c, "big_profit"))
+    sent = 0
+    for term, minp, keyfn in TERMS:
+        quiet = meta_get(c, "seed_" + term) is None  # first pass per term: only remember what exists
+        for it in search(term, pages=1, local=True, max_price=2500):
+            if it["price"] is None or it["price"] < minp or WANTED.search(it["title"]) or not relevant(term, it["title"]):
+                continue
+            row, new, dropped = upsert(c, it, term, keyfn, minp, True)
+            if row["risky"] or ignored(c, row):
+                continue
+            if not ((new and is_fresh(it)) or dropped) or (row["notified_price"] is not None and not dropped):
                 continue
             v = valuation(c, row, minp)
-            if chat and not quiet:
-                send_card(chat, row, v, "🆕 MacBook в Братиславе" if new else "📉 Цена снижена")
+            tag = alert_tag(row, v, budget, minprofit, bigprofit)
+            if not tag:
+                continue
+            if dropped and not new:
+                tag = "📉 Цена снижена · " + tag
+            if chat and not quiet and sent < max_alerts:
+                send_card(chat, row, v, tag)
+                sent += 1
             if chat:
                 c.execute("UPDATE listings SET notified_price=? WHERE id=?", (row["price"], row["id"]))
-            c.commit()
-    if chat:
-        meta_set(c, "seed_local", 1)
+        if chat:
+            meta_set(c, "seed_" + term, 1)
+        c.commit()
 
 
-def scan_market_term(c, chat):
-    idx = int(meta_get(c, "term_idx", 0)) % len(TERMS)
-    meta_set(c, "term_idx", idx + 1)
-    term, minp, keyfn = TERMS[idx]
-    budget, minprofit, bigprofit = int(cfg(c, "budget")), int(cfg(c, "min_profit")), int(cfg(c, "big_profit"))
-    log("market scan:", term)
-    for it in search(term, pages=3, max_price=2500):
-        if it["price"] is None or it["price"] < minp or WANTED.search(it["title"]):
-            continue
-        row, new, dropped = upsert(c, it, term, keyfn, minp, False)
-        if row["risky"] or ignored(c, row):
-            continue
-        if not ((new or dropped) and (row["notified_price"] is None or dropped)):
-            continue
-        v = valuation(c, row, minp)
-        if not v.get("enough"):
-            continue
-        tag = None
-        if row["price"] <= budget and v["profit"] >= minprofit and v["margin"] >= 0.15:
-            tag = "💸 Выгодное предложение"
-        elif row["price"] > budget and v["profit"] >= bigprofit and v["margin"] >= 0.2:
-            tag = "💎 Крупная сделка"
-        if tag and chat:
-            send_card(chat, row, v, tag)
-            c.execute("UPDATE listings SET notified_price=? WHERE id=?", (row["price"], row["id"]))
-    c.commit()
+def scan_market_learn(c, terms_per_cycle=2):
+    """Nationwide background scan: only collects prices/liquidity statistics, never sends alerts."""
+    for _ in range(terms_per_cycle):
+        idx = int(meta_get(c, "term_idx", 0)) % len(TERMS)
+        meta_set(c, "term_idx", idx + 1)
+        term, minp, keyfn = TERMS[idx]
+        log("market learn:", term)
+        for it in search(term, pages=3, max_price=2500):
+            if it["price"] is None or it["price"] < minp or WANTED.search(it["title"]) or not relevant(term, it["title"]):
+                continue
+            upsert(c, it, term, keyfn, minp, False)
+        c.commit()
 
 
 def check_gone(c, limit=20):
@@ -687,10 +721,10 @@ def status_text(c):
     return f"🤖 Бот работает.\nОбъявлений в базе: {n} (активных {a}, исчезло {g}).\nБюджет {cfg(c, 'budget')} €, мин. прибыль {cfg(c, 'min_profit')} €."
 
 
-WELCOME = ("👋 Привет! Я слежу за Bazos.sk и ищу выгодные товары для перепродажи.\n\n"
-           "• Новые MacBook в Братиславе +25 км приходят сразу.\n"
-           "• По всему рынку ищу товары дешевле медианы и считаю прибыль и ликвидность.\n"
-           "• Всё управление — кнопками внизу и под карточками.")
+WELCOME = ("👋 Привет! Я слежу за Bazos.sk круглосуточно.\n\n"
+           "🧠 В фоне изучаю цены и ликвидность всей техники по Словакии (Apple, консоли, видеокарты, камеры, ноутбуки и др.).\n"
+           "📩 Тебе присылаю только свежие выгодные предложения из Братиславы и +25 км, с расчётом прибыли и флагами риска.\n"
+           "🏆 Кнопка «Топ-10 Братислава» покажет лучшее из всего, что я уже видел.")
 
 
 def send(chat, text, kb=None):
@@ -778,7 +812,7 @@ def on_text(c, chat, text):
             return open_menu(c, chat, None, "settings")
         return send(chat, "Не понял. Введи число (или текст для названия) либо выбери кнопку.", MAIN_KB)
     if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
-        meta_set(c, "kb_v", "3")
+        meta_set(c, "kb_v", "4")
         return send(chat, WELCOME, MAIN_KB)
     send(chat, "Выбери действие кнопками внизу 👇", MAIN_KB)
 
@@ -888,15 +922,15 @@ def process_updates(c, wait=0):
             else:
                 on_text(c, chat, text)
         c.commit()
-    if chat and meta_get(c, "kb_v") != "3":
-        meta_set(c, "kb_v", "3")
-        send(chat, "🔄 Бот обновлён: кнопка «🏆 Топ-10 Братислава» и красные/зелёные флаги в карточках 👇", MAIN_KB)
+    if chat and meta_get(c, "kb_v") != "4":
+        meta_set(c, "kb_v", "4")
+        send(chat, "🔄 Бот обновлён: теперь он учится на всём рынке Bazos в фоне, а тебе шлёт только свежие предложения из Братиславы +25 км. Добавлено ещё 10 категорий техники 👇", MAIN_KB)
     return chat
 
 
 def scan_cycle(c, chat):
-    scan_local_macs(c, chat)
-    scan_market_term(c, chat)
+    scan_local_all(c, chat)
+    scan_market_learn(c)
     check_gone(c)
     notify_saved(c, chat)
     local_now = datetime.now(TZ)
@@ -919,7 +953,7 @@ def main():
             chat = process_updates(c, wait=25 if run_seconds else 0)
             if not chat:
                 log("no chat yet: send /start to the bot")
-            if time.time() - last_scan >= 300:
+            if time.time() - last_scan >= 180:
                 try:
                     scan_cycle(c, chat)
                 except Exception as e:  # keep the listener alive
