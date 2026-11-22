@@ -17,6 +17,7 @@ import sqlite3
 import statistics
 import sys
 import time
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1029,6 +1030,99 @@ def process_updates(c, wait=0):
     return chat
 
 
+# ---------- public dashboard (GitHub Pages; market data only, no trades/chat) ----------
+def model_rows(c, limit=60):
+    out = []
+    for r in c.execute("SELECT skey, COUNT(*) n FROM listings WHERE active=1 AND risky=0 AND hidden=0 AND skey IS NOT NULL GROUP BY skey HAVING n>=5 ORDER BY n DESC LIMIT 150"):
+        prices = [x["price"] for x in c.execute("SELECT price,title,descr FROM listings WHERE skey=? AND active=1 AND risky=0 AND price>0", (r["skey"],))
+                  if not SEALED.search(f"{x['title']} {x['descr']}")]
+        if len(prices) < 5:
+            continue
+        med = int(statistics.median(prices))
+        sold = c.execute("SELECT first_seen, gone_at FROM listings WHERE skey=? AND active=0 AND gone_at>? AND gone_at-first_seen<?",
+                         (r["skey"], NOW - 45 * 86400, 28 * 86400)).fetchall()
+        days = statistics.median([(x["gone_at"] - x["first_seen"]) / 86400 for x in sold]) if len(sold) >= 3 else None
+        npr = c.execute("SELECT price,url FROM newprice WHERE skey=? AND price IS NOT NULL", (r["skey"],)).fetchone()
+        out.append(dict(key=r["skey"], n=len(prices), median=med, new=npr["price"] if npr else None, url=npr["url"] if npr else None,
+                        days=days, sold=len(sold)))
+    out.sort(key=lambda x: (x["days"] is None, x["days"] or 0, -x["n"]))
+    return out[:limit]
+
+
+def render_dashboard(c):
+    now = datetime.now(TZ)
+    tot = c.execute("SELECT COUNT(*) n, SUM(active) a, SUM(CASE WHEN local=1 AND active=1 THEN 1 ELSE 0 END) l FROM listings").fetchone()
+    gone = c.execute("SELECT COUNT(*) FROM listings WHERE active=0").fetchone()[0]
+    newp = c.execute("SELECT COUNT(*) FROM newprice WHERE price IS NOT NULL").fetchone()[0]
+
+    def top_rows(since):
+        items, checked, skipped = best_local(c, since)
+        rows = ""
+        for i, (score, row, v, reds, greens) in enumerate(items, 1):
+            flags_s = "".join(f'<span class="f r">🚩 {esc(x[:60])}</span>' for x in reds) + "".join(f'<span class="f g">✅ {esc(x)}</span>' for x in greens)
+            new = f'{v["new"]["price"]} €' if v.get("new") else "—"
+            rows += (f'<tr><td>{i}</td><td><a href="{esc(row["url"])}" target="_blank" rel="noopener">{esc(row["title"][:70])}</a>'
+                     f'<div class="sub">{esc(row["loc"])} · {esc(row["mkey"])}</div>{flags_s}</td>'
+                     f'<td class="n">{row["price"]} €</td><td class="n">{v["sell"]} €</td><td class="n"><b>+{v["profit"]} €</b></td>'
+                     f'<td class="n">{new}</td><td>{esc(v["liq"].split(" (")[0])}</td></tr>')
+        return rows or '<tr><td colspan="7" class="sub">Пока нет объявлений с понятной прибылью — бот копит статистику.</td></tr>', checked
+
+    day_rows, day_checked = top_rows(NOW - 86400)
+    all_rows, all_checked = top_rows(None)
+    mrows = ""
+    for m in model_rows(c):
+        liq = "—" if m["days"] is None else f'{m["days"]:.1f} дн. ({m["sold"]})'
+        new = f'<a href="{esc(m["url"])}" target="_blank" rel="noopener">{m["new"]} €</a>' if m["new"] else "—"
+        mrows += f'<tr><td>{esc(m["key"])}</td><td class="n">{m["n"]}</td><td class="n">{m["median"]} €</td><td class="n">{new}</td><td class="n">{liq}</td></tr>'
+    head = "<tr><th>#</th><th>Объявление</th><th>Цена</th><th>Продажа ≈</th><th>Прибыль</th><th>Новый</th><th>Ликвидность</th></tr>"
+    return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="120"><title>Bazos Radar</title>
+<style>
+:root{{--bg:#f6f7f9;--card:#fff;--tx:#1b1f24;--mut:#6b7280;--bd:#e5e7eb;--ac:#2563eb;--g:#047857;--r:#b91c1c}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#0f1216;--card:#171b21;--tx:#e8eaed;--mut:#9aa3ad;--bd:#262c34;--ac:#6ea0ff;--g:#34d399;--r:#f87171}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
+main{{max-width:1100px;margin:0 auto;padding:16px}}h1{{font-size:22px;margin:8px 0}}h2{{font-size:17px;margin:26px 0 8px}}
+.kpi{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}}
+.k{{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px}}.k b{{font-size:22px;display:block}}.k span{{color:var(--mut);font-size:13px}}
+.card{{background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow-x:auto}}table{{border-collapse:collapse;width:100%;min-width:640px}}
+th,td{{padding:9px 10px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:top}}th{{font-size:12px;color:var(--mut);font-weight:600}}
+td.n{{text-align:right;white-space:nowrap}}a{{color:var(--ac);text-decoration:none}}.sub{{color:var(--mut);font-size:12px}}
+.f{{display:block;font-size:12px}}.f.r{{color:var(--r)}}.f.g{{color:var(--g)}}p.note{{color:var(--mut);font-size:13px}}
+</style></head><body><main>
+<h1>📡 Bazos Radar</h1>
+<p class="sub">Обновлено: {now.strftime("%d.%m.%Y %H:%M")} (Братислава) · страница обновляется сама каждые 2 минуты, данные — примерно раз в 10 минут</p>
+<div class="kpi"><div class="k"><b>{tot["n"] or 0}</b><span>объявлений изучено</span></div><div class="k"><b>{tot["a"] or 0}</b><span>активных сейчас</span></div>
+<div class="k"><b>{tot["l"] or 0}</b><span>активных в Братиславе +25 км</span></div><div class="k"><b>{gone}</b><span>исчезли (≈ проданы)</span></div>
+<div class="k"><b>{newp}</b><span>моделей с ценой нового</span></div></div>
+<h2>🏆 Топ-10 Братислава за сутки <span class="sub">(проверено {day_checked})</span></h2><div class="card"><table>{head}{day_rows}</table></div>
+<h2>🗂 Топ-10 Братислава за всё время <span class="sub">(проверено {all_checked})</span></h2><div class="card"><table>{head}{all_rows}</table></div>
+<h2>📊 Модели: цены и ликвидность по всему Bazos</h2>
+<div class="card"><table><tr><th>Модель</th><th>Объявл.</th><th>Медиана б/у</th><th>Новый (NAY.sk)</th><th>Продаётся за</th></tr>{mrows}</table></div>
+<p class="note">«Продажа ≈» — по похожим объявлениям (модель + память), без устаревших, запечатанных и выбросов, с потолком 85% от цены нового и −5% на торг. Ликвидность — по срокам исчезновения объявлений. Оценки справочные, не гарантия прибыли.</p>
+</main></body></html>"""
+
+
+def publish_site(c):
+    url, d = os.environ.get("SITE_PUSH_URL", ""), os.environ.get("SITE_DIR", "site")
+    if not url:
+        return
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
+        f.write(render_dashboard(c))
+    run = lambda *a: subprocess.run(a, cwd=d, check=True, capture_output=True, text=True)
+    try:
+        subprocess.run(["rm", "-rf", os.path.join(d, ".git")], check=True)
+        run("git", "init", "-q", "-b", "gh-pages")
+        run("git", "config", "user.name", "bazos-bot")
+        run("git", "config", "user.email", "bot@users.noreply.github.com")
+        run("git", "add", "-A")
+        run("git", "commit", "-q", "-m", "dashboard")
+        run("git", "push", "-q", "-f", url, "gh-pages:gh-pages")
+        meta_set(c, "site_pub", int(time.time()))
+    except subprocess.CalledProcessError as e:
+        log("publish_site failed:", (e.stderr or "")[:200].replace(url, "***"))
+
+
 def scan_cycle(c, chat):
     scan_local_all(c, chat)
     scan_market_learn(c)
@@ -1049,6 +1143,7 @@ def main():
     end = time.time() + run_seconds
     c = db_open()
     last_scan = 0.0
+    last_site = 0.0
     try:
         while True:
             NOW = int(time.time())
@@ -1062,6 +1157,13 @@ def main():
                     log("scan error", repr(e))
                 last_scan = time.time()
             c.commit()
+            if os.environ.get("SITE_PUSH_URL") and (time.time() - last_site >= 600 or time.time() >= end):
+                try:
+                    publish_site(c)
+                except Exception as e:
+                    log("site error", repr(e))
+                last_site = time.time()
+                c.commit()
             if time.time() >= end:
                 break
             if not TG_TOKEN:

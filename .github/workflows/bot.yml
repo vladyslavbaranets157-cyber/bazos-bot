@@ -14,25 +14,38 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - name: Load state (data branch)
+      - name: Load state (encrypted data branch)
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
-          git clone --depth 1 --branch data "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data \
-            || mkdir -p data
-          rm -rf data/.git
+          set -e
+          git clone --depth 1 --branch data "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" raw || mkdir -p raw
+          mkdir -p data
+          if [ -f raw/bazos.db.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -in raw/bazos.db.enc -out data/bazos.db -pass env:STATE_KEY
+          elif [ -f raw/bazos.db ]; then
+            cp raw/bazos.db data/bazos.db
+          fi
       - name: Run bot
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
           DB_PATH: data/bazos.db
           RUN_SECONDS: "1500"
+          SITE_PUSH_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
         run: python3 bot.py
-      - name: Save state
+      - name: Save state (encrypted)
         if: always()
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
-          cd data
+          set -e
+          [ -f data/bazos.db ] || exit 0
+          mkdir -p out && cd out && rm -rf .git
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in ../data/bazos.db -out bazos.db.enc -pass env:STATE_KEY
           git init -q -b data
           git config user.name "bazos-bot"
           git config user.email "bot@users.noreply.github.com"
           git add -A
-          git commit -q -m "state $(date -u +%FT%TZ)"
+          git commit -q -m "state"
           git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data:data
