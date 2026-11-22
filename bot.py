@@ -145,10 +145,45 @@ def specs(term, text):
     return f" {sto}GB" if sto else ""
 
 
+def _cpu(t):
+    t = t.lower()
+    m = re.search(r"\bi([3579])[\s-]*(\d{4,5})", t)
+    if m:
+        n = m.group(2)
+        return f"i{m.group(1)}-{n[:-3] if len(n) == 5 else n[:-3]}"
+    m = re.search(r"ryzen\s*([3579])\s*(\d)\d{3}", t)
+    return f"R{m.group(1)}-{m.group(2)}" if m else ""
+
+
+def gpu_class(title):
+    t = title.lower()
+    if re.search(r"notebook|laptop|ntb\b|legion\s*[57]\b.*(?:laptop|notebook)|helios|nitro\s*5|\bomen\b", t):
+        return "Laptop"
+    if re.search(r"\bpc\b|po[čc][íi]ta[čc]|desktop|zostava|komplet|\bsk[řr][íi][ňn]|gaming\s*pc|hern[ýy]\s*pc|\bi[3579][\s-]*\d{4}|ryzen|legion\s*t\d|\bt5\b", t):
+        return "PC"
+    return "GPU"
+
+
+def make_keys(term, keyfn, title, descr):
+    key = keyfn(title)
+    if term in ("rtx", "radeon rx") and getattr(keyfn, "base", "").startswith("GPU"):
+        cls = gpu_class(title)
+        if cls != "GPU":
+            key = f"{cls} {key[4:]}"  # "PC RTX 3070"
+            if cls == "PC":
+                cpu = _cpu(f"{title} {descr}")
+                key = f"{key} {cpu}".strip()
+    return key, key + specs(term, f"{title} {descr}")
+
+
 GENERIC_KEYS = {"MacBook", "MacBook Air", "MacBook Pro", "iPhone"}  # model not recognised -> mixed products
 
 
 def is_generic(mkey):
+    if mkey.startswith("Laptop "):
+        return True  # laptops with the same GPU differ hugely (CPU, screen, brand)
+    if mkey.startswith("PC "):
+        return not re.search(r"\bi[3579]-\d|\bR[3579]-\d", mkey) or not re.search(r"\d{4}", mkey)  # PC needs both GPU and CPU
     if mkey.startswith("MacBook") and not re.search(r"\bM[1-9]\b|Intel", mkey):
         return True  # MacBook without a chip: M1 and Intel Macs differ by hundreds of euros
     return mkey in GENERIC_KEYS or any(getattr(t[2], "base", None) == mkey for t in TERMS)
@@ -221,14 +256,13 @@ def db_open():
       skey TEXT PRIMARY KEY, price INTEGER, name TEXT, url TEXT, fetched_at INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS saved(
       id INTEGER PRIMARY KEY, saved_at INTEGER, last_price INTEGER, gone_notified INTEGER DEFAULT 0)""")
-    if meta_get(c, "skey_v") != "2":
+    if meta_get(c, "skey_v") != "3":
         fns = {t[0]: t[2] for t in TERMS}
         for r in c.execute("SELECT id, term, mkey, title, descr FROM listings").fetchall():
             fn = fns.get(r["term"])
-            mk = fn(r["title"]) if fn else r["mkey"]
-            c.execute("UPDATE listings SET mkey=?, skey=? WHERE id=?",
-                      (mk, mk + specs(r["term"], f"{r['title']} {r['descr']}"), r["id"]))
-        meta_set(c, "skey_v", "2")
+            mk, sk = make_keys(r["term"], fn, r["title"], r["descr"] or "") if fn else (r["mkey"], r["mkey"])
+            c.execute("UPDATE listings SET mkey=?, skey=? WHERE id=?", (mk, sk, r["id"]))
+        meta_set(c, "skey_v", "3")
         c.commit()
     return c
 
@@ -405,8 +439,7 @@ def refresh_newprices(c, limit=5):
 # ---------- valuation ----------
 def upsert(c, it, term, keyfn, minp, local):
     """Insert/update listing. Returns (row, is_new, price_dropped)."""
-    key = keyfn(it["title"])
-    skey = key + specs(term, f"{it['title']} {it['descr']}")
+    key, skey = make_keys(term, keyfn, it["title"], it["descr"])
     risky = 1 if RISKY.search(it["title"] + " " + it["descr"]) else 0
     row = c.execute("SELECT * FROM listings WHERE id=?", (it["id"],)).fetchone()
     loc_flag = 1 if (local or near_bratislava(it["zip"])) else 0
@@ -442,32 +475,45 @@ def valuation(c, row, minp):
     if len(comps) >= 5:
         med0 = statistics.median(r["price"] for r in comps)
         comps = [r for r in comps if 0.5 * med0 <= r["price"] <= 1.6 * med0]  # drop outliers
-    sold = [r for r in c.execute(
-        f"SELECT price, first_seen, gone_at FROM listings WHERE {col}=? AND active=0 AND gone_at>? AND price>=?",
-        (key, NOW - 45 * 86400, minp)) if (r["gone_at"] - r["first_seen"]) < 28 * 86400]
+    sold_all = [r for r in c.execute(
+        f"SELECT price, first_seen, gone_at FROM listings WHERE {col}=? AND active=0 AND gone_at>? AND price>=? ORDER BY gone_at DESC",
+        (key, NOW - 90 * 86400, minp)) if (r["gone_at"] - r["first_seen"]) < 28 * 86400]
+    sold = [r for r in sold_all if r["gone_at"] > NOW - 45 * 86400]
     days = [(r["gone_at"] - r["first_seen"]) / 86400 for r in sold]
-    if len(comps) >= 5:
+    from_sold = False
+    if len(comps) < 5 and len(sold_all) >= 3:
+        # nobody sells it now: fall back to the last prices of ads that disappeared (recent ones first)
+        comps, from_sold = sold_all[:10], True
+    if len(comps) >= 5 or from_sold:
         prices = sorted(r["price"] for r in comps)
         med = int(statistics.median(prices))
-        p30 = prices[int(0.3 * (len(prices) - 1))]
-        if len(sold) >= 3:  # prices of ads that actually disappeared are the most realistic
-            ref, basis = min(int(statistics.median(r["price"] for r in sold)), med), "по ценам реально исчезнувших объявлений"
+        p25 = prices[int(0.25 * (len(prices) - 1))]
+        if from_sold:
+            ref, basis = med, "активных объявлений нет — по последним ценам исчезнувших"
+        elif len(sold) >= 3:  # prices of ads that actually disappeared are the most realistic
+            ref, basis = min(int(statistics.median(r["price"] for r in sold)), p25 if len(prices) >= 8 else med), "по ценам реально исчезнувших объявлений"
         else:
-            ref, basis = p30, "по нижним 30% предложений (дешевле всех продаётся быстрее)"
+            ref, basis = p25, "по нижней четверти предложений (реально продают дешевле запроса)"
         npr = c.execute("SELECT price,name,url FROM newprice WHERE skey=? AND price IS NOT NULL", (row["skey"],)).fetchone()
         if not npr and row["skey"] != row["mkey"]:
             npr = c.execute("SELECT price,name,url FROM newprice WHERE skey=? AND price IS NOT NULL", (row["mkey"],)).fetchone()
-        v.update(enough=True, n_active=len(comps), median=med, lo=prices[0], hi=prices[-1],
-                 closest=sorted(comps, key=lambda r: abs(r["price"] - ref))[:3], new=None)
+        v.update(enough=True, n_active=len(comps), median=med, lo=prices[0], hi=prices[-1], from_sold=from_sold,
+                 closest=sorted(comps, key=lambda r: abs(r["price"] - ref))[:3] if not from_sold else [], new=None)
         if npr:
             v["new"] = dict(price=npr["price"], name=npr["name"], url=npr["url"])
             cap = int(npr["price"] * 0.85)  # a used item rarely sells above ~85% of the new price
             if ref > cap:
                 ref, basis = cap, f"ограничено 85% от цены нового ({npr['price']} €)"
             v["polluted"] = med > npr["price"] * 0.92  # used median ~ new price: sample likely contaminated
-        v.update(ref=ref, basis=basis, sell=int(ref * 0.95))
+        v.update(ref=ref, basis=basis, sell=int(ref * 0.9))
         v["profit"] = v["sell"] - (row["price"] or 0)
         v["margin"] = v["profit"] / max(row["price"] or 1, 1)
+        # price trend: recent ads (last 14 days) vs the 15-60 days before, active and gone together
+        allp = c.execute(f"SELECT price, first_seen FROM listings WHERE {col}=? AND price>=? AND first_seen>?", (key, minp, NOW - 60 * 86400)).fetchall()
+        new_p = [r["price"] for r in allp if r["first_seen"] > NOW - 14 * 86400]
+        old_p = [r["price"] for r in allp if r["first_seen"] <= NOW - 14 * 86400]
+        if len(new_p) >= 3 and len(old_p) >= 3:
+            v["trend"] = statistics.median(new_p) / statistics.median(old_p) - 1
     v["n_sold"] = len(days)
     if len(days) >= 3:
         md = statistics.median(days)
@@ -504,13 +550,18 @@ def card(row, v, tag):
              f"🏷 Модель: {esc(row['mkey'])}"]
     if v.get("enough"):
         lines.append(f"📊 Сравнил с {v['n_active']} похожими ({v['scope']}): {v['lo']}–{v['hi']} €, медиана {v['median']} €")
-        lines.append(f"🎯 Реалистичная цена продажи ≈ <b>{v['sell']} €</b> ({v['basis']}, −5% на торг)")
+        lines.append(f"🎯 Реалистичная цена продажи ≈ <b>{v['sell']} €</b> ({v['basis']}, −10% на торг)")
         if v.get("new"):
             n = v["new"]
             lines.append(f'🆕 Новый: <a href="{n["url"]}">{n["price"]} €</a> ({esc((n["name"] or "")[:55])}) — б/у ≈ {int(v["sell"] / n["price"] * 100)} % от нового')
         else:
-            lines.append("🆕 Цена нового товара не найдена — оценка без потолка по новой цене")
-        lines.append("🔎 Ближайшие: " + " · ".join(f'<a href="{r["url"]}">{r["price"]} €</a>' for r in v["closest"]))
+            lines.append("🆕 Новый в магазинах не найден — вероятно, снят с продажи (оценка без потолка по новой цене)")
+        if v.get("from_sold"):
+            lines.append("⚠️ Сейчас таких объявлений нет, цена по последним проданным — может устареть")
+        if "trend" in v:
+            lines.append(f"{'📈' if v['trend'] > 0.03 else '📉' if v['trend'] < -0.03 else '➡️'} Тренд цены за ~месяц: {v['trend'] * 100:+.0f} %")
+        if v["closest"]:
+            lines.append("🔎 Ближайшие: " + " · ".join(f'<a href="{r["url"]}">{r["price"]} €</a>' for r in v["closest"]))
         lines.append(f"💰 Ожидаемая прибыль ≈ <b>{v['profit']} €</b> ({int(v['margin'] * 100)} %)")
     else:
         lines.append("📊 Точная модель в объявлении не указана — цену по аналогам не оцениваю" if v.get("generic")
@@ -723,7 +774,7 @@ def top10_text(c, since, title):
             row_btns = []
     if row_btns:
         kb.append(row_btns)
-    lines.append("\n⭐ N — сохранить в избранное. Цена продажи — по похожим объявлениям (модель + память), без устаревших и выбросов, −5% на торг.")
+    lines.append("\n⭐ N — сохранить в избранное. Цена продажи — по похожим объявлениям (модель + память), без устаревших и выбросов, нижняя четверть цен и −10% на торг.")
     return "\n".join(lines)[:4000], json.dumps({"inline_keyboard": kb})
 
 
@@ -1138,7 +1189,7 @@ td.n{{text-align:right;white-space:nowrap}}a{{color:var(--ac);text-decoration:no
 <h2>🗂 Топ-10 Братислава за всё время <span class="sub">(проверено {all_checked})</span></h2><div class="card"><table>{head}{all_rows}</table></div>
 <h2>📊 Модели: цены и ликвидность по всему Bazos</h2>
 <div class="card"><table><tr><th>Модель</th><th>Объявл.</th><th>Медиана б/у</th><th>Новый (NAY.sk)</th><th>Продаётся за</th></tr>{mrows}</table></div>
-<p class="note">«Продажа ≈» — по похожим объявлениям (модель + память), без устаревших, запечатанных и выбросов, с потолком 85% от цены нового и −5% на торг. Ликвидность — по срокам исчезновения объявлений. Оценки справочные, не гарантия прибыли.</p>
+<p class="note">«Продажа ≈» — по похожим объявлениям (модель + память), без устаревших, запечатанных и выбросов, с потолком 85% от цены нового, нижняя четверть цен и −10% на торг. Ликвидность — по срокам исчезновения объявлений. Оценки справочные, не гарантия прибыли.</p>
 </main></body></html>"""
 
 

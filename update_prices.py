@@ -34,7 +34,7 @@ def main():
     keys = {}
     for col in ("skey", "mkey"):
         for r in db.execute(f"SELECT {col} k, MIN(mkey) m, COUNT(*) n FROM listings WHERE active=1 AND risky=0 AND {col} IS NOT NULL GROUP BY {col} HAVING n>=3"):
-            if not bot.is_generic(r[1]):
+            if not bot.is_generic(r[1]) and not r[1].startswith("PC "):
                 keys[r[0]] = (r[1], r[2])
     path = os.path.join(HERE, "newprices.json")
     try:
