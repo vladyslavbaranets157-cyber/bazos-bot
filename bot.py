@@ -786,7 +786,7 @@ def top10_menu():
 
 # ---------- UI ----------
 MAIN_KB = json.dumps({"keyboard": [["📊 Статистика", "🔥 Топ моделей"], ["🏆 Топ-10 Братислава"],
-                                    ["💰 Бюджет", "🎯 Цель"], ["🧾 Мои сделки", "⭐ Избранное"], ["⚙️ Настройки"]],
+                                    ["💰 Бюджет", "🎯 Цель"], ["🧾 Мои сделки", "⭐ Избранное"], ["📤 Выгрузить на OLX", "⚙️ Настройки"]],
                       "resize_keyboard": True})
 NUM = {  # key: (title, presets, unit)
     "budget": ("💰 Бюджет на покупку", [100, 200, 300, 500, 700, 1000, 1500], "€"),
@@ -948,6 +948,8 @@ def open_menu(c, chat, msg_id, name):
         t, kb = trades_menu(c)
     elif name == "fav":
         t, kb = favorites_menu(c)
+    elif name == "olx":
+        t, kb = olx_menu(c)
     elif name == "status":
         t, kb = status_text(c), None
     else:
@@ -964,7 +966,7 @@ def on_text(c, chat, text):
     pending = meta_get(c, "await", "")
     # a menu button always cancels a pending text input
     buttons = {"📊 Статистика": "stats", "🔥 Топ моделей": "top", "💰 Бюджет": "budget", "🎯 Цель": "goal",
-               "🧾 Мои сделки": "trades", "⭐ Избранное": "fav", "⚙️ Настройки": "settings", "🏆 Топ-10 Братислава": "top10"}
+               "🧾 Мои сделки": "trades", "⭐ Избранное": "fav", "⚙️ Настройки": "settings", "🏆 Топ-10 Братислава": "top10", "📤 Выгрузить на OLX": "olx"}
     if text in buttons:
         meta_set(c, "await", "")
         b = buttons[text]
@@ -981,6 +983,11 @@ def on_text(c, chat, text):
     if pending:
         meta_set(c, "await", "")
         kind, _, arg = pending.partition(":")
+        if kind == "olxphoto":
+            meta_set(c, "await", "olxphoto")
+            return send(chat, "Сейчас жду фото. Пришли фото или нажми «Готово» / «Отмена» под сообщением выше.")
+        if olx_on_text(c, chat, kind, arg, text):
+            return
         is_num = re.fullmatch(r"\d{1,6}", text) is not None
         if kind == "num" and is_num:
             set_num(c, arg, text)
@@ -1005,7 +1012,7 @@ def on_text(c, chat, text):
             return open_menu(c, chat, None, "settings")
         return send(chat, "Не понял. Введи число (или текст для названия) либо выбери кнопку.", MAIN_KB)
     if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
-        meta_set(c, "kb_v", "4")
+        meta_set(c, "kb_v", "5")
         return send(chat, WELCOME, MAIN_KB)
     send(chat, "Выбери действие кнопками внизу 👇", MAIN_KB)
 
@@ -1021,6 +1028,8 @@ def on_callback(c, chat, cq):
     ask = lambda kind, tid, q: (meta_set(c, "await", f"{kind}:{tid}"), send(chat, q))
     if act == "menu":
         open_menu(c, chat, mid, rest)
+    elif act == "ox":
+        olx_callback(c, chat, mid, rest)
     elif act == "set":
         key, _, val = rest.partition(":")
         set_num(c, key, val)
@@ -1096,11 +1105,22 @@ def process_updates(c, wait=0):
     if r and r.get("ok"):
         for u in r["result"]:
             meta_set(c, "tg_offset", u["update_id"] + 1)
+            mcm = u.get("my_chat_member")
+            if mcm and chat and str(mcm.get("from", {}).get("id")) == chat and mcm.get("chat", {}).get("type") in ("group", "supergroup") \
+                    and mcm.get("new_chat_member", {}).get("status") in ("member", "administrator"):
+                olx_connect(c, chat, mcm["chat"])
+                continue
+            m0 = u.get("message") or {}
+            if chat and m0.get("chat", {}).get("type") in ("group", "supergroup") and str(m0.get("from", {}).get("id")) == chat \
+                    and (m0.get("text") or "").startswith("/olx"):
+                olx_connect(c, chat, m0["chat"], m0.get("message_thread_id"))
+                continue
             cq = u.get("callback_query")
             msg = u.get("message") or (cq or {}).get("message") or {}
             cid = str(msg.get("chat", {}).get("id", ""))
             text = (u.get("message") or {}).get("text", "")
-            if not cid or not (text or cq):
+            photo = (u.get("message") or {}).get("photo")
+            if not cid or not (text or cq or photo):
                 continue
             if not chat:  # first /start claims the bot
                 if text.startswith("/start"):
@@ -1112,12 +1132,14 @@ def process_updates(c, wait=0):
                 continue
             if cq:
                 on_callback(c, chat, cq)
+            elif photo:
+                olx_on_photo(c, chat, u["message"])
             else:
                 on_text(c, chat, text)
         c.commit()
-    if chat and meta_get(c, "kb_v") != "4":
-        meta_set(c, "kb_v", "4")
-        send(chat, "🔄 Бот обновлён: теперь он учится на всём рынке Bazos в фоне, а тебе шлёт только свежие предложения из Братиславы +25 км. Добавлено ещё 10 категорий техники 👇", MAIN_KB)
+    if chat and meta_get(c, "kb_v") != "5":
+        meta_set(c, "kb_v", "5")
+        send(chat, "🔄 Бот обновлён: теперь он учится на всём рынке Bazos в фоне, а тебе шлёт только свежие предложения из Братиславы +25 км. Новая кнопка «📤 Выгрузить на OLX»: автоотправка твоих объявлений в группу по очереди 👇", MAIN_KB)
     return chat
 
 
@@ -1214,6 +1236,295 @@ def publish_site(c):
         log("publish_site failed:", (e.stderr or "")[:200].replace(url, "***"))
 
 
+# ---------- OLX group posting (own ads -> Telegram group, rotating) ----------
+OLX_PRESETS = [15, 30, 60, 120, 180, 360, 720, 1440]
+
+
+def tg_once(method, **params):
+    """One Telegram call without retries; returns the parsed JSON incl. error description."""
+    if not TG_TOKEN:
+        return {"ok": False, "description": "no token"}
+    try:
+        req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/{method}",
+                                     data=urllib.parse.urlencode(params).encode())
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e:  # noqa
+        return {"ok": False, "description": repr(e)}
+
+
+def fmt_interval(m):
+    m = int(m)
+    return f"{m} мин" if m < 60 else (f"{m // 60} ч" if m % 60 == 0 else f"{m // 60} ч {m % 60} мин")
+
+
+def olx_init(c):
+    c.execute("""CREATE TABLE IF NOT EXISTS olx_ads(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, photos TEXT, text TEXT, active INTEGER DEFAULT 1,
+      created INTEGER, last_sent INTEGER DEFAULT 0, sent_count INTEGER DEFAULT 0, last_msgs TEXT DEFAULT '[]')""")
+
+
+def olx_interval(c):
+    return int(meta_get(c, "olx_interval", 60))
+
+
+def olx_next_ad(c):
+    return c.execute("SELECT * FROM olx_ads WHERE active=1 ORDER BY last_sent ASC, id ASC LIMIT 1").fetchone()
+
+
+def olx_post(c, ad):
+    """Send the ad to the group. Returns (ok, error text). The previous copy of the same ad is removed first."""
+    group = meta_get(c, "olx_group")
+    if not group:
+        return False, "группа не подключена"
+    base = dict(chat_id=group)
+    if meta_get(c, "olx_thread"):
+        base["message_thread_id"] = meta_get(c, "olx_thread")
+    for mid in json.loads(ad["last_msgs"] or "[]"):
+        tg_once("deleteMessage", chat_id=group, message_id=mid)
+    photos, text = json.loads(ad["photos"]), ad["text"] or ""
+    cap = text if len(text) <= 1024 else ""
+    ids = []
+    if len(photos) == 1:
+        r = tg_once("sendPhoto", photo=photos[0], **({"caption": cap} if cap else {}), **base)
+        if r.get("ok"):
+            ids.append(r["result"]["message_id"])
+    else:
+        media = [{"type": "photo", "media": f} for f in photos[:10]]
+        if cap:
+            media[0]["caption"] = cap
+        r = tg_once("sendMediaGroup", media=json.dumps(media), **base)
+        if r.get("ok"):
+            ids += [m["message_id"] for m in r["result"]]
+    if not r.get("ok"):
+        return False, r.get("description", "неизвестная ошибка")
+    if not cap and text:
+        r2 = tg_once("sendMessage", text=text[:4000], **base)
+        if r2.get("ok"):
+            ids.append(r2["result"]["message_id"])
+    c.execute("UPDATE olx_ads SET last_sent=?, sent_count=sent_count+1, last_msgs=? WHERE id=?",
+              (NOW, json.dumps(ids), ad["id"]))
+    return True, ""
+
+
+def olx_tick(c, chat):
+    if meta_get(c, "olx_on", "1") != "1" or not meta_get(c, "olx_group"):
+        return
+    if NOW < int(meta_get(c, "olx_next", 0)):
+        return
+    ad = olx_next_ad(c)
+    if not ad:
+        return
+    ok, err = olx_post(c, ad)
+    if ok:
+        meta_set(c, "olx_next", NOW + olx_interval(c) * 60)
+    else:
+        meta_set(c, "olx_next", NOW + 600)  # retry in 10 minutes
+        if NOW - int(meta_get(c, "olx_err_ts", 0)) > 3600 and chat:
+            meta_set(c, "olx_err_ts", NOW)
+            send(chat, f"⚠️ Не удалось отправить объявление #{ad['id']} в группу: {esc(err)}\n"
+                       "Проверь, что бот в группе и ему разрешено писать (лучше сделать его админом).")
+    c.commit()
+
+
+def olx_menu(c):
+    n = c.execute("SELECT COUNT(*) FROM olx_ads").fetchone()[0]
+    act = c.execute("SELECT COUNT(*) FROM olx_ads WHERE active=1").fetchone()[0]
+    group = meta_get(c, "olx_group")
+    on = meta_get(c, "olx_on", "1") == "1"
+    lines = ["📤 <b>Выгрузка на OLX Словакия</b>",
+             f"👥 Группа: <b>{esc(meta_get(c, 'olx_title', 'подключена'))}</b>" if group else "👥 Группа: ⚠️ не подключена (нажми «Подключить группу»)",
+             f"⏱ Интервал: раз в <b>{fmt_interval(olx_interval(c))}</b> одно объявление, по очереди",
+             f"📋 Объявлений: {n} (в очереди {act})",
+             "⏯ Автоотправка: " + ("✅ включена" if on else "⏸ на паузе")]
+    nxt, ad = int(meta_get(c, "olx_next", 0)), olx_next_ad(c)
+    if group and on and ad:
+        lines.append(f"⏭ Следующее: #{ad['id']} через ~{max(0, (nxt - NOW) // 60)} мин")
+    kb = [[{"text": "➕ Новое объявление", "callback_data": "ox:new"}],
+          [{"text": f"📋 Выставленные объявления ({n})", "callback_data": "ox:list"}],
+          [{"text": "⏱ Интервал", "callback_data": "ox:int"},
+           {"text": "⏸ Пауза" if on else "▶️ Включить", "callback_data": "ox:onoff"}],
+          [{"text": "👥 Подключить группу", "callback_data": "ox:group"}]]
+    return "\n".join(lines), json.dumps({"inline_keyboard": kb})
+
+
+def olx_list(c):
+    rows = c.execute("SELECT * FROM olx_ads ORDER BY id").fetchall()
+    kb = []
+    for r in rows:
+        title = (r["text"] or "").strip().split("\n")[0][:32] or "без текста"
+        kb.append([{"text": f"{'▶️' if r['active'] else '⏸'} #{r['id']} {title} · {r['sent_count']}×", "callback_data": f"ox:ad:{r['id']}"}])
+    kb.append([{"text": "➕ Новое", "callback_data": "ox:new"}, {"text": "⬅️ Назад", "callback_data": "menu:olx"}])
+    return ("📋 <b>Объявления на автоотправку</b>\nНажми на объявление, чтобы изменить или удалить." if rows
+            else "Пока нет объявлений. Нажми «Новое»."), json.dumps({"inline_keyboard": kb})
+
+
+def olx_detail(c, aid):
+    r = c.execute("SELECT * FROM olx_ads WHERE id=?", (aid,)).fetchone()
+    if not r:
+        return "Объявление не найдено.", None
+    last = datetime.fromtimestamp(r["last_sent"], TZ).strftime("%d.%m %H:%M") if r["last_sent"] else "ещё не отправлялось"
+    t = (f"📦 <b>Объявление #{r['id']}</b> — {'в очереди ▶️' if r['active'] else 'на паузе ⏸'}\n"
+         f"🖼 Фото: {len(json.loads(r['photos']))}\n📤 Отправлено: {r['sent_count']} раз, последнее: {last}\n\n"
+         f"📝 {esc((r['text'] or '')[:700])}")
+    kb = [[{"text": "📤 Отправить сейчас", "callback_data": f"ox:now:{aid}"}],
+          [{"text": "✏️ Фото", "callback_data": f"ox:eph:{aid}"}, {"text": "✏️ Текст", "callback_data": f"ox:etx:{aid}"}],
+          [{"text": "⏸ На паузу" if r["active"] else "▶️ Вернуть в очередь", "callback_data": f"ox:tog:{aid}"},
+           {"text": "🗑 Удалить", "callback_data": f"ox:delq:{aid}"}],
+          [{"text": "⬅️ К списку", "callback_data": "ox:list"}]]
+    return t, json.dumps({"inline_keyboard": kb})
+
+
+def olx_draft(c):
+    try:
+        return json.loads(meta_get(c, "olx_draft", "") or "{}")
+    except Exception:
+        return {}
+
+
+def olx_start_photos(c, chat, edit=None):
+    meta_set(c, "olx_draft", json.dumps({"photos": [], "text": "", "edit": edit, "mg": ""}))
+    meta_set(c, "await", "olxphoto")
+    kb = json.dumps({"inline_keyboard": [[{"text": "✅ Готово", "callback_data": "ox:done"},
+                                          {"text": "✖️ Отмена", "callback_data": "ox:cancel"}]]})
+    send(chat, ("✏️ <b>Новые фото</b>" if edit else "➕ <b>Шаг 1 из 3 — фото</b>") +
+         "\nПришли фото для объявления (можно несколько, до 10; отправляй как фото, не как файл). Когда закончишь, нажми «Готово».", kb)
+
+
+def olx_on_photo(c, chat, msg):
+    d = olx_draft(c)
+    if meta_get(c, "await", "") != "olxphoto":
+        return send(chat, "Фото принимаю только в разделе «📤 Выгрузить на OLX» → «Новое объявление».", MAIN_KB)
+    if len(d["photos"]) >= 10:
+        return send(chat, "Максимум 10 фото. Нажми «Готово».")
+    d["photos"].append(msg["photo"][-1]["file_id"])
+    mg = msg.get("media_group_id", "")
+    first = not mg or mg != d.get("mg")
+    d["mg"] = mg
+    meta_set(c, "olx_draft", json.dumps(d))
+    if first:
+        send(chat, f"🖼 Фото принято. Всего: {len(d['photos'])} (дальше нажми «Готово» под сообщением выше). ")
+
+
+def olx_on_text(c, chat, kind, arg, text):
+    """Handles await states olxtext / olxetext. Returns True when consumed."""
+    if kind == "olxtext":
+        d = olx_draft(c)
+        d["text"] = text[:3500]
+        meta_set(c, "olx_draft", json.dumps(d))
+        rows = [[{"text": fmt_interval(m), "callback_data": f"ox:fin:{m}"} for m in OLX_PRESETS[i:i + 4]] for i in (0, 4)]
+        send(chat, "➕ <b>Шаг 3 из 3 — как часто отправлять</b>\nОдно объявление за раз; если их несколько, они идут по очереди и "
+                   f"не повторяются подряд. Сейчас: раз в {fmt_interval(olx_interval(c))}.", json.dumps({"inline_keyboard": rows}))
+        return True
+    if kind == "olxetext":
+        c.execute("UPDATE olx_ads SET text=? WHERE id=?", (text[:3500], int(arg)))
+        t, kb = olx_detail(c, int(arg))
+        send(chat, "✅ Текст обновлён (в группе изменится при следующей отправке).\n\n" + t, kb)
+        return True
+    return False
+
+
+def olx_callback(c, chat, mid, rest):
+    act, _, arg = rest.partition(":")
+    if act == "new":
+        olx_start_photos(c, chat)
+    elif act == "done":
+        d = olx_draft(c)
+        if not d.get("photos"):
+            return send(chat, "Сначала пришли хотя бы одно фото.")
+        if d.get("edit"):
+            c.execute("UPDATE olx_ads SET photos=? WHERE id=?", (json.dumps(d["photos"]), d["edit"]))
+            meta_set(c, "await", "")
+            t, kb = olx_detail(c, d["edit"])
+            return send(chat, "✅ Фото обновлены.\n\n" + t, kb)
+        meta_set(c, "await", "olxtext")
+        send(chat, f"🖼 Фото: {len(d['photos'])}.\n\n➕ <b>Шаг 2 из 3 — описание</b>\nНапиши текст объявления (название, цена, состояние, контакты). Одним сообщением:")
+    elif act == "cancel":
+        meta_set(c, "await", "")
+        meta_set(c, "olx_draft", "")
+        t, kb = olx_menu(c)
+        send(chat, "Отменено.\n\n" + t, kb)
+    elif act == "fin":
+        d = olx_draft(c)
+        if not d.get("photos") or not d.get("text"):
+            return send(chat, "Черновик потерялся, начни заново: «Новое объявление».")
+        meta_set(c, "olx_interval", int(arg))
+        cur = c.execute("INSERT INTO olx_ads(photos,text,created) VALUES(?,?,?)", (json.dumps(d["photos"]), d["text"], NOW))
+        if not int(meta_get(c, "olx_next", 0)):
+            meta_set(c, "olx_next", NOW)
+        else:
+            meta_set(c, "olx_next", min(int(meta_get(c, "olx_next", 0)), NOW + int(arg) * 60))
+        meta_set(c, "olx_draft", "")
+        meta_set(c, "await", "")
+        t, kb = olx_detail(c, cur.lastrowid)
+        send(chat, f"✅ Добавлено в очередь. Интервал: раз в {fmt_interval(arg)}.\n\n" + t, kb)
+    elif act == "list":
+        t, kb = olx_list(c)
+        show(chat, mid, t, kb)
+    elif act == "ad":
+        t, kb = olx_detail(c, int(arg))
+        show(chat, mid, t, kb)
+    elif act == "eph":
+        olx_start_photos(c, chat, edit=int(arg))
+    elif act == "etx":
+        meta_set(c, "await", f"olxetext:{arg}")
+        send(chat, "✏️ Напиши новый текст объявления:")
+    elif act == "tog":
+        c.execute("UPDATE olx_ads SET active=1-active WHERE id=?", (int(arg),))
+        t, kb = olx_detail(c, int(arg))
+        show(chat, mid, t, kb)
+    elif act == "now":
+        ad = c.execute("SELECT * FROM olx_ads WHERE id=?", (int(arg),)).fetchone()
+        ok, err = olx_post(c, ad) if ad else (False, "не найдено")
+        send(chat, "📤 Отправлено в группу." if ok else f"⚠️ Не вышло: {esc(err)}")
+    elif act == "delq":
+        kb = json.dumps({"inline_keyboard": [
+            [{"text": "🗑 Удалить из очереди", "callback_data": f"ox:del:{arg}:0"}],
+            [{"text": "🗑 + убрать из группы", "callback_data": f"ox:del:{arg}:1"}],
+            [{"text": "Нет, оставить", "callback_data": f"ox:ad:{arg}"}]]})
+        show(chat, mid, f"Удалить объявление #{arg}?", kb)
+    elif act == "del":
+        aid, _, wipe = arg.partition(":")
+        ad = c.execute("SELECT * FROM olx_ads WHERE id=?", (int(aid),)).fetchone()
+        if ad and wipe == "1" and meta_get(c, "olx_group"):
+            for m in json.loads(ad["last_msgs"] or "[]"):
+                tg_once("deleteMessage", chat_id=meta_get(c, "olx_group"), message_id=m)
+        c.execute("DELETE FROM olx_ads WHERE id=?", (int(aid),))
+        t, kb = olx_list(c)
+        show(chat, mid, "🗑 Удалено.\n\n" + t, kb)
+    elif act == "int":
+        rows = [[{"text": fmt_interval(m) + (" ✓" if m == olx_interval(c) else ""), "callback_data": f"ox:setint:{m}"} for m in OLX_PRESETS[i:i + 4]] for i in (0, 4)]
+        rows.append([{"text": "⬅️ Назад", "callback_data": "menu:olx"}])
+        show(chat, mid, "⏱ Как часто отправлять одно объявление в группу (по очереди):", json.dumps({"inline_keyboard": rows}))
+    elif act == "setint":
+        meta_set(c, "olx_interval", int(arg))
+        meta_set(c, "olx_next", min(int(meta_get(c, "olx_next", 0)) or NOW, NOW + int(arg) * 60))
+        t, kb = olx_menu(c)
+        show(chat, mid, t, kb)
+    elif act == "onoff":
+        meta_set(c, "olx_on", "0" if meta_get(c, "olx_on", "1") == "1" else "1")
+        t, kb = olx_menu(c)
+        show(chat, mid, t, kb)
+    elif act == "group":
+        send(chat, "👥 <b>Подключение группы «OLX Словакия»</b>\n1. Добавь этого бота в группу (лучше назначить админом, чтобы он мог писать и удалять свои сообщения).\n"
+                   "2. Напиши в самой группе (в нужной теме, если это форум) команду <code>/olx</code>.\n"
+                   "Бот запомнит группу и напишет тебе сюда. Если бота добавишь прямо сейчас, группа подключится автоматически.")
+
+
+def olx_connect(c, chat, chat_obj, thread=None):
+    meta_set(c, "olx_group", chat_obj["id"])
+    meta_set(c, "olx_title", chat_obj.get("title", "группа"))
+    meta_set(c, "olx_thread", thread or "")
+    if not int(meta_get(c, "olx_next", 0)):
+        meta_set(c, "olx_next", NOW)
+    send(chat, f"✅ Группа подключена: <b>{esc(chat_obj.get('title', 'группа'))}</b>. Теперь можно добавлять объявления.", MAIN_KB)
+
+
 def scan_cycle(c, chat):
     scan_local_all(c, chat)
     scan_market_learn(c)
@@ -1232,6 +1543,7 @@ def main():
     run_seconds = int(os.environ.get("RUN_SECONDS", "0") or 0)  # 0 = single pass
     end = time.time() + run_seconds
     c = db_open()
+    olx_init(c)
     log("new prices loaded:", load_newprices(c))
     last_scan = 0.0
     last_site = 0.0
@@ -1241,6 +1553,10 @@ def main():
             chat = process_updates(c, wait=25 if run_seconds else 0)
             if not chat:
                 log("no chat yet: send /start to the bot")
+            try:
+                olx_tick(c, chat)
+            except Exception as e:
+                log("olx error", repr(e))
             if time.time() - last_scan >= 180:
                 try:
                     scan_cycle(c, chat)
