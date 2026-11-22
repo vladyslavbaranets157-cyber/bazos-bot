@@ -84,6 +84,7 @@ def _re_key(label, pat):
     def f(t):
         m = re.search(pat, t.lower())
         return f"{label} {m.group(1).upper() if m else ''}".strip()
+    f.base = label
     return f
 
 
@@ -142,6 +143,15 @@ def specs(term, text):
     if term == "macbook":
         return (f" {ram}GB" if ram else "") + (f"/{sto}GB" if sto else "")
     return f" {sto}GB" if sto else ""
+
+
+GENERIC_KEYS = {"MacBook", "MacBook Air", "MacBook Pro", "iPhone"}  # model not recognised -> mixed products
+
+
+def is_generic(mkey):
+    if mkey.startswith("MacBook") and not re.search(r"\bM[1-9]\b|Intel", mkey):
+        return True  # MacBook without a chip: M1 and Intel Macs differ by hundreds of euros
+    return mkey in GENERIC_KEYS or any(getattr(t[2], "base", None) == mkey for t in TERMS)
 
 
 # ---------- tiny helpers ----------
@@ -295,6 +305,12 @@ ACCESSORY = re.compile(r"^(puzdro|obal|kryt|sklo|ochrann|dr[žz]iak|nab[ií]ja[�
 USED_NEW = re.compile(r"kozmetick|repasovan|pou[žz]it|renovovan|obnoven|bazár|vystaven", re.I)
 
 
+ACCESSORY_ANY = re.compile(r"ovl[áa]da[čc]|dia[ľl]kov|nab[ií]ja[čc]|k[áa]bel|puzdro|dr[žz]iak|bat[ée]ri|\bkryt|\bobal|ta[šs]ka|remienok|p[áa]sik|filter|stoj[áa]n|adapt[ée]r|z[áa]ruk|roz[šs][ií]ren|care refresh|demo|vezre|v[ýy]stavn", re.I)
+# a name with one of these words is a DIFFERENT product unless the query itself has the word
+VARIANTS = {"pro", "ti", "fe", "plus", "max", "ultra", "mini", "air", "se", "lite", "oled", "xt", "super", "classic",
+            "digital", "neo", "xbox", "x20", "z1", "z2", "extreme", "edge", "flip", "fold", "mavic", "avata", "neo2"}
+
+
 def norm_tokens(text):
     t = text.lower().replace('"', " ").replace("/", " ").replace("″", " ")
     t = re.sub(r"(\d)\s+(gb|tb)\b", r"\1\2", t)
@@ -322,10 +338,12 @@ def nay_lookup(query, floor=0):
         name, price = d.get("item_name", ""), d.get("price")
         if not name or not isinstance(price, (int, float)) or price <= 0:
             continue
-        if ACCESSORY.search(name) or USED_NEW.search(name) or price < floor:
+        if ACCESSORY.search(name) or ACCESSORY_ANY.search(name) or USED_NEW.search(name) or price < floor:
             continue
         have = set(norm_tokens(name))
         if not (want - relaxed) <= have:
+            continue
+        if (have & VARIANTS) - want:  # e.g. query "RTX 5060" must not match "RTX 5060 Ti"
             continue
         ml = re.search(r'href="(/[^"]+)" tabindex="-1" class="product-box-link-box"', page[m.start():m.start() + 1500])
         if best is None or price < best[0]:
@@ -337,7 +355,25 @@ def newprice_query(skey):
     q = skey.replace("GB/", "GB ").replace('"', "")
     q = re.sub(r"^PS5\b", "PlayStation 5", q)
     q = re.sub(r"^GPU ", "", q)
+    q = re.sub(r"^Galaxy S (\d)", r"Samsung Galaxy S\1", q)
+    q = re.sub(r"^Switch\b", "Nintendo Switch", q)
+    q = re.sub(r"^GoPro (\d)", r"GoPro Hero \1", q)
     return q.strip()
+
+
+def load_newprices(c, path=None):
+    """Load new-price reference collected locally (update_prices.py) into the DB."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "newprices.json")
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        return 0
+    c.execute("DELETE FROM newprice")
+    for k, d in data.get("prices", {}).items():
+        c.execute("INSERT OR REPLACE INTO newprice(skey,price,name,url,fetched_at) VALUES(?,?,?,?,?)",
+                  (k, d.get("price"), d.get("name"), d.get("url"), NOW))
+    c.commit()
+    return len(data.get("prices", {}))
 
 
 def refresh_newprices(c, limit=5):
@@ -399,7 +435,10 @@ def valuation(c, row, minp):
     fresh = [r for r in comps if r["first_seen"] > NOW - 30 * 86400]  # old unsold ads are overpriced
     if len(fresh) >= 5:
         comps = fresh
-    v = {"n_active": len(comps), "enough": False, "scope": scope}
+    v = {"n_active": len(comps), "enough": False, "scope": scope, "liq": "❔ мало данных (бот копит статистику)"}
+    if is_generic(row["mkey"]):
+        v["generic"] = True  # title does not say which exact model: comparing would mix different products
+        return v
     if len(comps) >= 5:
         med0 = statistics.median(r["price"] for r in comps)
         comps = [r for r in comps if 0.5 * med0 <= r["price"] <= 1.6 * med0]  # drop outliers
@@ -468,13 +507,14 @@ def card(row, v, tag):
         lines.append(f"🎯 Реалистичная цена продажи ≈ <b>{v['sell']} €</b> ({v['basis']}, −5% на торг)")
         if v.get("new"):
             n = v["new"]
-            lines.append(f'🆕 Новый в NAY.sk: <a href="{n["url"]}">{n["price"]} €</a> (б/у ≈ {int(v["sell"] / n["price"] * 100)} % от нового)')
+            lines.append(f'🆕 Новый: <a href="{n["url"]}">{n["price"]} €</a> ({esc((n["name"] or "")[:55])}) — б/у ≈ {int(v["sell"] / n["price"] * 100)} % от нового')
         else:
             lines.append("🆕 Цена нового товара не найдена — оценка без потолка по новой цене")
         lines.append("🔎 Ближайшие: " + " · ".join(f'<a href="{r["url"]}">{r["price"]} €</a>' for r in v["closest"]))
         lines.append(f"💰 Ожидаемая прибыль ≈ <b>{v['profit']} €</b> ({int(v['margin'] * 100)} %)")
     else:
-        lines.append(f"📊 Мало похожих объявлений ({v['n_active']}) — цена не проверена")
+        lines.append("📊 Точная модель в объявлении не указана — цену по аналогам не оцениваю" if v.get("generic")
+                     else f"📊 Мало похожих объявлений ({v['n_active']}) — цена не проверена")
     lines.append(f"⏱ Ликвидность: {v['liq']}" + (f", продаётся ~{v['days']:.0f} дн. ({v['n_sold']} продаж)" if "days" in v else ""))
     reds, greens = flags(row, v)
     for r in reds:
@@ -1126,7 +1166,6 @@ def publish_site(c):
 def scan_cycle(c, chat):
     scan_local_all(c, chat)
     scan_market_learn(c)
-    refresh_newprices(c)
     check_gone(c)
     notify_saved(c, chat)
     local_now = datetime.now(TZ)
@@ -1142,6 +1181,7 @@ def main():
     run_seconds = int(os.environ.get("RUN_SECONDS", "0") or 0)  # 0 = single pass
     end = time.time() + run_seconds
     c = db_open()
+    log("new prices loaded:", load_newprices(c))
     last_scan = 0.0
     last_site = 0.0
     try:
