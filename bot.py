@@ -9,7 +9,7 @@ One invocation = one cycle (designed for GitHub Actions cron every 5 min):
   5. daily report at 08:00 Bratislava time
 State lives in a SQLite file (DB_PATH). Only stdlib is used.
 """
-import html as H
+import io, html as H
 import json
 import os
 import re
@@ -1105,16 +1105,6 @@ def process_updates(c, wait=0):
     if r and r.get("ok"):
         for u in r["result"]:
             meta_set(c, "tg_offset", u["update_id"] + 1)
-            mcm = u.get("my_chat_member")
-            if mcm and chat and str(mcm.get("from", {}).get("id")) == chat and mcm.get("chat", {}).get("type") in ("group", "supergroup") \
-                    and mcm.get("new_chat_member", {}).get("status") in ("member", "administrator"):
-                olx_connect(c, chat, mcm["chat"])
-                continue
-            m0 = u.get("message") or {}
-            if chat and m0.get("chat", {}).get("type") in ("group", "supergroup") and str(m0.get("from", {}).get("id")) == chat \
-                    and (m0.get("text") or "").startswith("/olx"):
-                olx_connect(c, chat, m0["chat"], m0.get("message_thread_id"))
-                continue
             cq = u.get("callback_query")
             msg = u.get("message") or (cq or {}).get("message") or {}
             cid = str(msg.get("chat", {}).get("id", ""))
@@ -1277,39 +1267,91 @@ def olx_next_ad(c):
     return c.execute("SELECT * FROM olx_ads WHERE active=1 ORDER BY last_sent ASC, id ASC LIMIT 1").fetchone()
 
 
+def olx_ready():
+    return all(os.environ.get(k) for k in ("TG_API_ID", "TG_API_HASH", "TG_SESSION"))
+
+
+def tl_run(fn):
+    """Run an async job as the user's own Telegram account (Telethon). Returns fn's result."""
+    import asyncio
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    async def go():
+        cl = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+        await cl.connect()
+        try:
+            if not await cl.is_user_authorized():
+                raise RuntimeError("сессия аккаунта недействительна — войди заново (tg_login.py)")
+            return await fn(cl)
+        finally:
+            await cl.disconnect()
+    return asyncio.run(go())
+
+
+def bot_download(file_id):
+    r = tg("getFile", file_id=file_id)
+    path = r["result"]["file_path"]
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=40) as f:
+        return f.read()
+
+
 def olx_post(c, ad):
-    """Send the ad to the group. Returns (ok, error text). The previous copy of the same ad is removed first."""
+    """Post the ad to the group as the user's own account. The previous copy of the same ad is removed first."""
     group = meta_get(c, "olx_group")
     if not group:
-        return False, "группа не подключена"
-    base = dict(chat_id=group)
-    if meta_get(c, "olx_thread"):
-        base["message_thread_id"] = meta_get(c, "olx_thread")
-    for mid in json.loads(ad["last_msgs"] or "[]"):
-        tg_once("deleteMessage", chat_id=group, message_id=mid)
+        return False, "группа не выбрана"
+    if not olx_ready():
+        return False, "аккаунт Telegram не подключён"
     photos, text = json.loads(ad["photos"]), ad["text"] or ""
-    cap = text if len(text) <= 1024 else ""
-    ids = []
-    if len(photos) == 1:
-        r = tg_once("sendPhoto", photo=photos[0], **({"caption": cap} if cap else {}), **base)
-        if r.get("ok"):
-            ids.append(r["result"]["message_id"])
-    else:
-        media = [{"type": "photo", "media": f} for f in photos[:10]]
-        if cap:
-            media[0]["caption"] = cap
-        r = tg_once("sendMediaGroup", media=json.dumps(media), **base)
-        if r.get("ok"):
-            ids += [m["message_id"] for m in r["result"]]
-    if not r.get("ok"):
-        return False, r.get("description", "неизвестная ошибка")
-    if not cap and text:
-        r2 = tg_once("sendMessage", text=text[:4000], **base)
-        if r2.get("ok"):
-            ids.append(r2["result"]["message_id"])
+    old = json.loads(ad["last_msgs"] or "[]")
+    try:
+        blobs = []
+        for i, fid in enumerate(photos[:10]):
+            bio = io.BytesIO(bot_download(fid))
+            bio.name = f"photo{i}.jpg"
+            blobs.append(bio)
+
+        async def job(cl):
+            await cl.get_dialogs(limit=300)  # fills the entity cache of a fresh session
+            ent = await cl.get_entity(int(group))
+            if old:
+                await cl.delete_messages(ent, old)
+            cap = text if len(text) <= 1024 else ""
+            sent = await cl.send_file(ent, blobs if len(blobs) > 1 else blobs[0], caption=cap)
+            ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
+            if text and not cap:
+                m2 = await cl.send_message(ent, text[:4000])
+                ids.append(m2.id)
+            return ids
+        ids = tl_run(job)
+    except Exception as e:  # noqa
+        return False, f"{type(e).__name__}: {e}"[:300]
     c.execute("UPDATE olx_ads SET last_sent=?, sent_count=sent_count+1, last_msgs=? WHERE id=?",
               (NOW, json.dumps(ids), ad["id"]))
     return True, ""
+
+
+def olx_pick_groups(c, chat):
+    if not olx_ready():
+        return send(chat, "⚠️ Аккаунт Telegram ещё не подключён к боту. Нужно один раз выполнить на Mac <code>python3 ~/bazos-bot/tg_login.py</code>.")
+
+    async def job(cl):
+        out = []
+        async for d in cl.iter_dialogs(limit=300):
+            if d.is_group:
+                out.append([d.id, d.name or "без названия"])
+        return out
+    try:
+        groups = tl_run(job)
+    except Exception as e:  # noqa
+        return send(chat, f"⚠️ Не удалось получить список групп: {esc(str(e)[:200])}")
+    groups.sort(key=lambda g: (0 if "olx" in g[1].lower() else 1, g[1].lower()))
+    groups = groups[:20]
+    meta_set(c, "olx_pick", json.dumps(groups))
+    kb = [[{"text": g[1][:40], "callback_data": f"ox:g:{i}"}] for i, g in enumerate(groups)]
+    send(chat, "👥 Выбери группу, куда отправлять объявления (список твоих групп в Telegram):" if groups else "Групп в аккаунте не нашёл.",
+         json.dumps({"inline_keyboard": kb}))
 
 
 def olx_tick(c, chat):
@@ -1328,7 +1370,7 @@ def olx_tick(c, chat):
         if NOW - int(meta_get(c, "olx_err_ts", 0)) > 3600 and chat:
             meta_set(c, "olx_err_ts", NOW)
             send(chat, f"⚠️ Не удалось отправить объявление #{ad['id']} в группу: {esc(err)}\n"
-                       "Проверь, что бот в группе и ему разрешено писать (лучше сделать его админом).")
+                       "Проверь, что твой аккаунт состоит в группе и ему разрешено писать.")
     c.commit()
 
 
@@ -1338,7 +1380,8 @@ def olx_menu(c):
     group = meta_get(c, "olx_group")
     on = meta_get(c, "olx_on", "1") == "1"
     lines = ["📤 <b>Выгрузка на OLX Словакия</b>",
-             f"👥 Группа: <b>{esc(meta_get(c, 'olx_title', 'подключена'))}</b>" if group else "👥 Группа: ⚠️ не подключена (нажми «Подключить группу»)",
+             f"👥 Группа: <b>{esc(meta_get(c, 'olx_title', 'подключена'))}</b>" if group else "👥 Группа: ⚠️ не выбрана (нажми «Выбрать группу»)",
+             "👤 Отправка с твоего аккаунта Telegram: " + ("✅ подключён" if olx_ready() else "⚠️ не подключён"),
              f"⏱ Интервал: раз в <b>{fmt_interval(olx_interval(c))}</b> одно объявление, по очереди",
              f"📋 Объявлений: {n} (в очереди {act})",
              "⏯ Автоотправка: " + ("✅ включена" if on else "⏸ на паузе")]
@@ -1349,7 +1392,7 @@ def olx_menu(c):
           [{"text": f"📋 Выставленные объявления ({n})", "callback_data": "ox:list"}],
           [{"text": "⏱ Интервал", "callback_data": "ox:int"},
            {"text": "⏸ Пауза" if on else "▶️ Включить", "callback_data": "ox:onoff"}],
-          [{"text": "👥 Подключить группу", "callback_data": "ox:group"}]]
+          [{"text": "👥 Выбрать группу", "callback_data": "ox:group"}]]
     return "\n".join(lines), json.dumps({"inline_keyboard": kb})
 
 
@@ -1511,9 +1554,13 @@ def olx_callback(c, chat, mid, rest):
         t, kb = olx_menu(c)
         show(chat, mid, t, kb)
     elif act == "group":
-        send(chat, "👥 <b>Подключение группы «OLX Словакия»</b>\n1. Добавь этого бота в группу (лучше назначить админом, чтобы он мог писать и удалять свои сообщения).\n"
-                   "2. Напиши в самой группе (в нужной теме, если это форум) команду <code>/olx</code>.\n"
-                   "Бот запомнит группу и напишет тебе сюда. Если бота добавишь прямо сейчас, группа подключится автоматически.")
+        olx_pick_groups(c, chat)
+    elif act == "g":
+        try:
+            gid, title = json.loads(meta_get(c, "olx_pick", "[]"))[int(arg)]
+        except Exception:
+            return send(chat, "Список устарел, нажми «Выбрать группу» ещё раз.")
+        olx_connect(c, chat, {"id": gid, "title": title})
 
 
 def olx_connect(c, chat, chat_obj, thread=None):
@@ -1522,7 +1569,7 @@ def olx_connect(c, chat, chat_obj, thread=None):
     meta_set(c, "olx_thread", thread or "")
     if not int(meta_get(c, "olx_next", 0)):
         meta_set(c, "olx_next", NOW)
-    send(chat, f"✅ Группа подключена: <b>{esc(chat_obj.get('title', 'группа'))}</b>. Теперь можно добавлять объявления.", MAIN_KB)
+    send(chat, f"✅ Группа выбрана: <b>{esc(chat_obj.get('title', 'группа'))}</b>. Теперь можно добавлять объявления.", MAIN_KB)
 
 
 def scan_cycle(c, chat):

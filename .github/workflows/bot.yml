@@ -26,8 +26,13 @@ jobs:
           elif [ -f raw/bazos.db ]; then
             cp raw/bazos.db data/bazos.db
           fi
+      - name: Install Telethon (own-account posting)
+        run: pip install --quiet telethon
       - name: Run bot
         env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
           DB_PATH: data/bazos.db
