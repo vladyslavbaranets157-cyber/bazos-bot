@@ -56,6 +56,7 @@ GREEN = [
     (re.compile(r"krabic|krabic[ou]|origin[áa]lne balen|v balen[ií]|\bbox\b", re.I), "есть коробка"),
     (re.compile(r"prv[ýy] majite|1\.?\s*majite|jeden majite|prv[ée]ho majite|od prv[ée]ho", re.I), "первый владелец"),
 ]
+SEALED = re.compile(r"zape[čc]at|neotvoren|nerozbalen|sealed|nepou[žz]it|[úu]plne nov|nov[ýáé]\s*(?:,|v)?\s*(?:v\s*)?balen|nov[ýáé]\s+nerozbal|\bnov[ýáé]\b\s*[,.]?\s*z[áa]ruk", re.I)
 WANTED = re.compile(r"^\s*(kúpim|kupim|hľadám|hladam|zoženiem|zozenem|vykupujem|výkup|vykup)\b", re.I)
 
 
@@ -99,7 +100,7 @@ TERMS = [
     ("ps5", 150, lambda t: "PS5 Digital" if "digital" in t.lower() else "PS5"),
     ("xbox series", 120, _re_key("Xbox Series", r"\b([sx])\b")),
     ("nintendo switch", 80, lambda t: "Switch OLED" if "oled" in t.lower() else "Switch Lite" if "lite" in t.lower() else "Switch"),
-    ("steam deck", 200, _fixed("Steam Deck")),
+    ("steam deck", 200, lambda t: "Steam Deck OLED" if "oled" in t.lower() else "Steam Deck"),
     ("rtx", 80, _re_key("GPU RTX", r"rtx\s*(\d{4}\s*(?:ti|super)?)")),
     ("dji", 60, _re_key("DJI", r"(mini\s*\d?|mavic\s*\w*|osmo\s*\w*|air\s*\d|pocket\s*\d)")),
     ("gopro", 60, _re_key("GoPro", r"hero\s*(\d+)")),
@@ -109,7 +110,7 @@ TERMS = [
     ("thinkpad", 100, _re_key("ThinkPad", r"(t\d{2,3}\w?|x1 carbon|x\d{3}|p\d{2})")),
     ("radeon rx", 60, _re_key("GPU RX", r"rx\s*(\d{4}\s*(?:xt)?)")),
     ("rog ally", 250, _fixed("ROG Ally")),
-    ("meta quest", 100, _re_key("Meta Quest", r"quest\s*(\d|pro)")),
+    ("meta quest", 100, _re_key("Meta Quest", r"quest\s*(3s|2|3|pro)")),
     ("sony wh-1000xm", 60, _re_key("Sony WH-1000XM", r"xm\s*([3-6])")),
     ("sony alpha", 250, _re_key("Sony Alpha", r"(a7\w*|a6\d{3}|a9\w*|zv-?e?\d+)")),
     ("canon eos", 150, _re_key("Canon EOS", r"(r\d+\w*|\d{2,4}d|rp)")),
@@ -120,7 +121,7 @@ APPLE_TERMS = {"macbook", "iphone", "ipad", "apple watch", "airpods", "mac mini"
 
 def specs(term, text):
     """Memory/storage suffix so that 8/256 is compared with 8/256, not with 16/512."""
-    if term not in ("macbook", "ipad", "samsung galaxy s"):
+    if term not in ("macbook", "ipad", "samsung galaxy s", "meta quest", "steam deck"):
         return ""
     t = text.lower()
     ram = sto = None
@@ -205,12 +206,18 @@ def db_open():
             c.execute(ddl)
         except sqlite3.OperationalError:
             pass
+    c.execute("""CREATE TABLE IF NOT EXISTS newprice(
+      skey TEXT PRIMARY KEY, price INTEGER, name TEXT, url TEXT, fetched_at INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS saved(
       id INTEGER PRIMARY KEY, saved_at INTEGER, last_price INTEGER, gone_notified INTEGER DEFAULT 0)""")
-    if meta_get(c, "skey_v") != "1":
+    if meta_get(c, "skey_v") != "2":
+        fns = {t[0]: t[2] for t in TERMS}
         for r in c.execute("SELECT id, term, mkey, title, descr FROM listings").fetchall():
-            c.execute("UPDATE listings SET skey=? WHERE id=?", ((r["mkey"] or "") + specs(r["term"], f"{r['title']} {r['descr']}"), r["id"]))
-        meta_set(c, "skey_v", "1")
+            fn = fns.get(r["term"])
+            mk = fn(r["title"]) if fn else r["mkey"]
+            c.execute("UPDATE listings SET mkey=?, skey=? WHERE id=?",
+                      (mk, mk + specs(r["term"], f"{r['title']} {r['descr']}"), r["id"]))
+        meta_set(c, "skey_v", "2")
         c.commit()
     return c
 
@@ -282,6 +289,82 @@ def near_bratislava(zp):
     return zp[:2] in ("81", "82", "83", "84", "85") or zp[:3] in ("900", "901", "902", "903", "931")
 
 
+# ---------- new price (NAY.sk) ----------
+ACCESSORY = re.compile(r"^(puzdro|obal|kryt|sklo|ochrann|dr[žz]iak|nab[ií]ja[čc]|k[áa]bel|ta[šs]ka|remienok|adapt[ée]r|dock|stojan|fólia|folia|pr[ií]slu[šs]|n[áa]hradn|bat[ée]ri|hlavov[ýy] p[áa]s|strap|controller|ovl[áa]da[čc]|dot)", re.I)
+USED_NEW = re.compile(r"kozmetick|repasovan|pou[žz]it|renovovan|obnoven|bazár|vystaven", re.I)
+
+
+def norm_tokens(text):
+    t = text.lower().replace('"', " ").replace("/", " ").replace("″", " ")
+    t = re.sub(r"(\d)\s+(gb|tb)\b", r"\1\2", t)
+    return [w for w in re.findall(r"[a-z0-9\u00e0-\u024f]+", t)]
+
+
+def nay_lookup(query, floor=0):
+    """Cheapest NEW price for a model on NAY.sk (plain HTML, product data in data-gtm-data-product)."""
+    st, page, _ = http("https://www.nay.sk/vyhladavanie?q=" + urllib.parse.quote_plus(query), tries=2)
+    if st != 200:
+        return None
+    want = set(norm_tokens(query)) - {"gb", "tb"}
+    # retailers rarely put RAM in the title: relax it if a storage token is present
+    relaxed = {w for w in want if re.fullmatch(r"(4|8|16|24|32|64)gb", w)} if any(re.fullmatch(r"(128|256|512|1024|2048)gb|\dtb", w) for w in want) else set()
+    best = None
+    for m in re.finditer(r"data-gtm-data-product='(\{.*?\})'", page):
+        raw = m.group(1)
+        try:
+            d = json.loads(raw)
+        except Exception:
+            try:
+                d = json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", raw))
+            except Exception:
+                continue
+        name, price = d.get("item_name", ""), d.get("price")
+        if not name or not isinstance(price, (int, float)) or price <= 0:
+            continue
+        if ACCESSORY.search(name) or USED_NEW.search(name) or price < floor:
+            continue
+        have = set(norm_tokens(name))
+        if not (want - relaxed) <= have:
+            continue
+        ml = re.search(r'href="(/[^"]+)" tabindex="-1" class="product-box-link-box"', page[m.start():m.start() + 1500])
+        if best is None or price < best[0]:
+            best = (int(price), name, "https://www.nay.sk" + ml.group(1) if ml else "https://www.nay.sk/")
+    return best
+
+
+def newprice_query(skey):
+    q = skey.replace("GB/", "GB ").replace('"', "")
+    q = re.sub(r"^PS5\b", "PlayStation 5", q)
+    q = re.sub(r"^GPU ", "", q)
+    return q.strip()
+
+
+def refresh_newprices(c, limit=5):
+    """Look up new prices (cached 7 days, misses 3 days) for models that matter: those seen locally or with many comps."""
+    rows = c.execute("""SELECT skey, COUNT(*) n, MAX(local) loc FROM listings WHERE active=1 AND skey IS NOT NULL
+                        GROUP BY skey HAVING n>=3 OR loc=1 ORDER BY loc DESC, n DESC""").fetchall()
+    done = 0
+    for r in rows:
+        if done >= limit:
+            break
+        cur = c.execute("SELECT * FROM newprice WHERE skey=?", (r["skey"],)).fetchone()
+        ttl = 7 * 86400 if cur and cur["price"] else 3 * 86400
+        if cur and cur["fetched_at"] > NOW - ttl:
+            continue
+        used = [x["price"] for x in c.execute("SELECT price FROM listings WHERE skey=? AND active=1 AND risky=0", (r["skey"],))]
+        if len(used) < 3:
+            used = [x["price"] for x in c.execute("SELECT price FROM listings WHERE mkey=? AND active=1 AND risky=0", (r["skey"].split(" ")[0],))]
+        if len(used) < 3:
+            continue
+        # a "new price" far below used prices is an accessory, not the product
+        res = nay_lookup(newprice_query(r["skey"]), floor=0.6 * statistics.median(used))
+        c.execute("INSERT OR REPLACE INTO newprice(skey,price,name,url,fetched_at) VALUES(?,?,?,?,?)",
+                  (r["skey"], res[0] if res else None, res[1] if res else None, res[2] if res else None, NOW))
+        done += 1
+        time.sleep(1.5)
+    c.commit()
+
+
 # ---------- valuation ----------
 def upsert(c, it, term, keyfn, minp, local):
     """Insert/update listing. Returns (row, is_new, price_dropped)."""
@@ -304,13 +387,14 @@ def upsert(c, it, term, keyfn, minp, local):
 
 def valuation(c, row, minp):
     """Price estimate from comparable listings (same model AND memory/storage), cleaned of stale and outlier ads."""
-    sql = ("SELECT id,title,url,price,first_seen FROM listings WHERE {col}=? AND active=1 AND risky=0 "
+    sql = ("SELECT id,title,descr,url,price,first_seen FROM listings WHERE {col}=? AND active=1 AND risky=0 "
            "AND hidden=0 AND price>=? AND id!=?")
     scope, col, key = "модель + память", "skey", row["skey"]
     comps = c.execute(sql.format(col="skey"), (row["skey"], minp, row["id"])).fetchall() if row["skey"] and row["skey"] != row["mkey"] else []
     if len(comps) < 5:
         scope, col, key = "модель (память не указана)", "mkey", row["mkey"]
         comps = c.execute(sql.format(col="mkey"), (row["mkey"], minp, row["id"])).fetchall()
+    comps = [r for r in comps if not SEALED.search(f"{r['title']} {r['descr']}")]  # new/sealed ads are not "used" prices
     fresh = [r for r in comps if r["first_seen"] > NOW - 30 * 86400]  # old unsold ads are overpriced
     if len(fresh) >= 5:
         comps = fresh
@@ -330,8 +414,18 @@ def valuation(c, row, minp):
             ref, basis = min(int(statistics.median(r["price"] for r in sold)), med), "по ценам реально исчезнувших объявлений"
         else:
             ref, basis = p30, "по нижним 30% предложений (дешевле всех продаётся быстрее)"
-        v.update(enough=True, n_active=len(comps), median=med, ref=ref, basis=basis, lo=prices[0], hi=prices[-1],
-                 sell=int(ref * 0.95), closest=sorted(comps, key=lambda r: abs(r["price"] - ref))[:3])
+        npr = c.execute("SELECT price,name,url FROM newprice WHERE skey=? AND price IS NOT NULL", (row["skey"],)).fetchone()
+        if not npr and row["skey"] != row["mkey"]:
+            npr = c.execute("SELECT price,name,url FROM newprice WHERE skey=? AND price IS NOT NULL", (row["mkey"],)).fetchone()
+        v.update(enough=True, n_active=len(comps), median=med, lo=prices[0], hi=prices[-1],
+                 closest=sorted(comps, key=lambda r: abs(r["price"] - ref))[:3], new=None)
+        if npr:
+            v["new"] = dict(price=npr["price"], name=npr["name"], url=npr["url"])
+            cap = int(npr["price"] * 0.85)  # a used item rarely sells above ~85% of the new price
+            if ref > cap:
+                ref, basis = cap, f"ограничено 85% от цены нового ({npr['price']} €)"
+            v["polluted"] = med > npr["price"] * 0.92  # used median ~ new price: sample likely contaminated
+        v.update(ref=ref, basis=basis, sell=int(ref * 0.95))
         v["profit"] = v["sell"] - (row["price"] or 0)
         v["margin"] = v["profit"] / max(row["price"] or 1, 1)
     v["n_sold"] = len(days)
@@ -351,6 +445,8 @@ def flags(row, v):
         reds.append("в тексте: повреждён / на запчасти / iCloud / не включается — проверь!")
     if v.get("enough") and row["price"] and row["price"] <= v["median"] * 0.5:
         reds.append("слишком дёшево (−50% и больше от медианы) — часто мошенник или краденое")
+    if v.get("polluted"):
+        reds.append("медиана б/у почти равна цене нового — выборка могла загрязниться, проверь цену вручную")
     for rx, label in SOFT_RED:
         if rx.search(text):
             reds.append(label)
@@ -369,6 +465,11 @@ def card(row, v, tag):
     if v.get("enough"):
         lines.append(f"📊 Сравнил с {v['n_active']} похожими ({v['scope']}): {v['lo']}–{v['hi']} €, медиана {v['median']} €")
         lines.append(f"🎯 Реалистичная цена продажи ≈ <b>{v['sell']} €</b> ({v['basis']}, −5% на торг)")
+        if v.get("new"):
+            n = v["new"]
+            lines.append(f'🆕 Новый в NAY.sk: <a href="{n["url"]}">{n["price"]} €</a> (б/у ≈ {int(v["sell"] / n["price"] * 100)} % от нового)')
+        else:
+            lines.append("🆕 Цена нового товара не найдена — оценка без потолка по новой цене")
         lines.append("🔎 Ближайшие: " + " · ".join(f'<a href="{r["url"]}">{r["price"]} €</a>' for r in v["closest"]))
         lines.append(f"💰 Ожидаемая прибыль ≈ <b>{v['profit']} €</b> ({int(v['margin'] * 100)} %)")
     else:
@@ -452,7 +553,7 @@ def scan_local_all(c, chat, max_alerts=8):
             if not ((new and is_fresh(it)) or dropped) or (row["notified_price"] is not None and not dropped):
                 continue
             v = valuation(c, row, minp)
-            tag = alert_tag(row, v, budget, minprofit, bigprofit)
+            tag = alert_tag(row, v, budget, minprofit, bigprofit) if not v.get("polluted") else None
             if not tag:
                 continue
             if dropped and not new:
@@ -549,7 +650,7 @@ def best_local(c, since=None, n=10):
             skipped += 1
             continue
         v = valuation(c, row, term[1])
-        if not v.get("enough") or v["profit"] < 10 or v["margin"] < 0.1:
+        if not v.get("enough") or v["profit"] < 10 or v["margin"] < 0.1 or v.get("polluted"):
             continue
         reds, greens = flags(row, v)
         if row["price"] <= v["median"] * 0.5:  # suspiciously cheap: not ranked
@@ -931,6 +1032,7 @@ def process_updates(c, wait=0):
 def scan_cycle(c, chat):
     scan_local_all(c, chat)
     scan_market_learn(c)
+    refresh_newprices(c)
     check_gone(c)
     notify_saved(c, chat)
     local_now = datetime.now(TZ)
