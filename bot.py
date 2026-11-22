@@ -1315,17 +1315,23 @@ def olx_post(c, ad):
         async def job(cl):
             await cl.get_dialogs(limit=300)  # fills the entity cache of a fresh session
             ent = await cl.get_entity(int(group))
-            if old:
-                await cl.delete_messages(ent, old)
             cap = text if len(text) <= 1024 else ""
             sent = await cl.send_file(ent, blobs if len(blobs) > 1 else blobs[0], caption=cap)
             ids = [m.id for m in (sent if isinstance(sent, list) else [sent])]
             if text and not cap:
                 m2 = await cl.send_message(ent, text[:4000])
                 ids.append(m2.id)
+            if old:  # remove the previous copy only after the new one is out
+                try:
+                    await cl.delete_messages(ent, old)
+                except Exception:  # noqa
+                    pass
             return ids
         ids = tl_run(job)
     except Exception as e:  # noqa
+        wait = getattr(e, "seconds", None)  # SlowModeWaitError / FloodWaitError
+        if wait:
+            return False, f"wait:{int(wait)}"
         return False, f"{type(e).__name__}: {e}"[:300]
     c.execute("UPDATE olx_ads SET last_sent=?, sent_count=sent_count+1, last_msgs=? WHERE id=?",
               (NOW, json.dumps(ids), ad["id"]))
@@ -1365,6 +1371,13 @@ def olx_tick(c, chat):
     ok, err = olx_post(c, ad)
     if ok:
         meta_set(c, "olx_next", NOW + olx_interval(c) * 60)
+    elif err.startswith("wait:"):  # group slow mode / flood limit: just wait it out
+        wait = int(err[5:]) + 30
+        meta_set(c, "olx_next", NOW + wait)
+        if NOW - int(meta_get(c, "olx_wait_ts", 0)) > 6 * 3600 and chat:
+            meta_set(c, "olx_wait_ts", NOW)
+            send(chat, f"⏳ В группе включён медленный режим: следующее сообщение можно отправить через {wait // 60} мин. "
+                       "Подожду и отправлю сам. Интервал лучше ставить не меньше этого лимита.")
     else:
         meta_set(c, "olx_next", NOW + 600)  # retry in 10 minutes
         if NOW - int(meta_get(c, "olx_err_ts", 0)) > 3600 and chat:
@@ -1524,6 +1537,8 @@ def olx_callback(c, chat, mid, rest):
     elif act == "now":
         ad = c.execute("SELECT * FROM olx_ads WHERE id=?", (int(arg),)).fetchone()
         ok, err = olx_post(c, ad) if ad else (False, "не найдено")
+        if not ok and err.startswith("wait:"):
+            err = f"в группе медленный режим, можно будет через {int(err[5:]) // 60 + 1} мин (старое объявление в группе осталось на месте)"
         send(chat, "📤 Отправлено в группу." if ok else f"⚠️ Не вышло: {esc(err)}")
     elif act == "delq":
         kb = json.dumps({"inline_keyboard": [
